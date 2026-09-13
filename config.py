@@ -33,12 +33,12 @@ def _get_bool(name: str, default: bool) -> bool:
 
 
 # ---- Telegram credentials (Pyrogram/Pyrofork) ----
-API_ID: int = _get_int("API_ID", 0)
-API_HASH: str = os.getenv("API_HASH", "")
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
+API_ID: int = _get_int("API_ID", 20599570)
+API_HASH: str = os.getenv("API_HASH", "0d5a7f73ea37f1d11dd470cda9a1a75f")
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "7357607802:AAHdbb0ygtAJ6jMwbCjGGrqpgGmmcLjVOOU")
 
 # ---- Owner / access control ----
-OWNER_ID: int = _get_int("OWNER_ID", 0)
+OWNER_ID: int = _get_int("OWNER_ID", 6858251193)
 # Comma-separated list of Telegram user IDs allowed to use the bot.
 # Leave empty to allow anyone who can message the bot.
 _raw_allowed = os.getenv("ALLOWED_USER_IDS", "")
