@@ -32,7 +32,11 @@ DEFAULTS: Dict[str, Any] = {
     "leech_prefix": "",
     "leech_suffix": "",
     "leech_caption": "",         # supports {filename} and {size}; empty -> just filename
-    "metadata_title": None,      # embedded into video/audio via ffmpeg if set
+    "metadata_title": None,      # legacy: plain global title (still honored as a fallback)
+    "metadata_global": "",       # e.g. "Auth=@Channel, title={basename}" -- whole-container tags
+    "metadata_video": "",        # e.g. "title=@Channel" -- applied to every video stream
+    "metadata_audio": "",        # e.g. "language={audiolang}, title=@Channel" -- every audio stream
+    "metadata_subtitle": "",     # e.g. "language={sublang}, title=@Channel" -- every subtitle stream
     "dump_chat_id": None,        # every leeched file is also copied here if set
     "name_swap_enabled": False,
     "name_swap_pairs": [],       # list of [find, replace] applied to filenames

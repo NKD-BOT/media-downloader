@@ -46,7 +46,32 @@ _PROMPTS = {
         "Example: `<b><a href='https://t.me/yourchannel'>{filename}</a></b>`\n"
         "Send `-` to clear it."
     ),
-    "metadata_title": "Send the *metadata title* to embed into video/audio files (requires ffmpeg), or `-` to clear it.",
+    "metadata_global": (
+        "Send *Global metadata* -- applies once to the whole file. Format: `key=value`, "
+        "several separated by commas. Supports `{basename}`/`{filename}`.\n"
+        "Example: `Auth=@CARZYHUBXBOT, title={basename}`\n"
+        "Send `-` to clear it."
+    ),
+    "metadata_video": (
+        "Send *Video stream metadata* -- applied to every video stream. Format: `key=value`, "
+        "several separated by commas.\n"
+        "Example: `title=@CARZYHUBXBOT`\n"
+        "Send `-` to clear it."
+    ),
+    "metadata_audio": (
+        "Send *Audio stream metadata* -- applied to every audio stream. Format: `key=value`, "
+        "several separated by commas. `{audiolang}` = raw code (e.g. `hin`, correct for the "
+        "`language` field itself); `{audiolang_name}` = readable name (e.g. `Hindi`, for use in a title).\n"
+        "Example: `language={audiolang}, title=@CARZYHUBXBOT - {audiolang_name}`\n"
+        "Send `-` to clear it."
+    ),
+    "metadata_subtitle": (
+        "Send *Subtitle stream metadata* -- applied to every subtitle stream. Format: `key=value`, "
+        "several separated by commas. `{sublang}` = raw code (e.g. `eng`, correct for the "
+        "`language` field itself); `{sublang_name}` = readable name (e.g. `English`, for use in a title).\n"
+        "Example: `language={sublang}, title=@CARZYHUBXBOT - {sublang_name}`\n"
+        "Send `-` to clear it."
+    ),
     "dump_chat_id": "Send the *dump chat ID* every leeched file should also be copied to (the bot must already be a member/admin there), or `-` to clear it.",
     "name_swap_pair": (
         "Send one or more patterns to strip/replace, as `find:::replace`. "
@@ -96,7 +121,8 @@ def _main_menu_text(settings: Dict[str, Any]) -> str:
     lines.append(f"Prefix: `{settings['leech_prefix'] or '—'}`")
     lines.append(f"Suffix: `{settings['leech_suffix'] or '—'}`")
     lines.append(f"Caption: `{settings['leech_caption'] or '—'}`")
-    lines.append(f"Metadata title: `{settings['metadata_title'] or '—'}`")
+    metadata_set = any(settings.get(k) for k in ("metadata_title", "metadata_global", "metadata_video", "metadata_audio", "metadata_subtitle"))
+    lines.append(f"Metadata: {'set ✅' if metadata_set else 'not set'}")
     lines.append(f"Dump chat: `{settings['dump_chat_id'] or '—'}`")
     lines.append(f"Thumbnail: {'set ✅' if settings['thumbnail_path'] else 'not set'}")
     swap_state = "on" if settings["name_swap_enabled"] else "off"
@@ -116,13 +142,38 @@ def _main_menu_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton("📝 Leech Caption", callback_data="lset:caption"),
-            InlineKeyboardButton("🏷 Metadata", callback_data="lset:metadata"),
+            InlineKeyboardButton("🏷 Metadata", callback_data="lset:meta_menu"),
         ],
         [
             InlineKeyboardButton("📤 Dump", callback_data="lset:dump"),
             InlineKeyboardButton("🔀 Name Swap", callback_data="lset:swap_menu"),
         ],
         [
+            InlineKeyboardButton("❌ Close", callback_data="lset:close"),
+        ],
+    ])
+
+
+def _metadata_menu_text(settings: Dict[str, Any]) -> str:
+    lines = ["🏷 *Metadata*", "", "Applied via ffmpeg before upload (video/audio files only).", ""]
+    lines.append(f"Global: `{settings.get('metadata_global') or '—'}`")
+    lines.append(f"Video: `{settings.get('metadata_video') or '—'}`")
+    lines.append(f"Audio: `{settings.get('metadata_audio') or '—'}`")
+    lines.append(f"Subtitle: `{settings.get('metadata_subtitle') or '—'}`")
+    if settings.get("metadata_title"):
+        lines.append(f"\n_Legacy title (still applied if the fields above are empty): `{settings['metadata_title']}`_")
+    return "\n".join(lines)
+
+
+def _metadata_menu_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🌐 Global", callback_data="lset:meta_global")],
+        [InlineKeyboardButton("🎬 Video", callback_data="lset:meta_video")],
+        [InlineKeyboardButton("🔊 Audio", callback_data="lset:meta_audio")],
+        [InlineKeyboardButton("📝 Subtitle", callback_data="lset:meta_subtitle")],
+        [InlineKeyboardButton("🗑 Clear All", callback_data="lset:meta_clear")],
+        [
+            InlineKeyboardButton("⬅️ Back", callback_data="lset:back"),
             InlineKeyboardButton("❌ Close", callback_data="lset:close"),
         ],
     ])
@@ -166,15 +217,23 @@ async def _render_swap(message: Message, settings: Dict[str, Any]) -> None:
     )
 
 
+async def _render_metadata(message: Message, settings: Dict[str, Any]) -> None:
+    await message.edit_text(
+        _metadata_menu_text(settings),
+        reply_markup=_metadata_menu_keyboard(settings),
+    )
+
+
 def _prompt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="lset:back")]])
 
 
-async def _ask_for(query: CallbackQuery, key: str) -> None:
+async def _ask_for(query: CallbackQuery, key: str, menu: str = "main") -> None:
     _pending[query.from_user.id] = {
         "key": key,
         "chat_id": query.message.chat.id,
         "message_id": query.message.id,
+        "menu": menu,  # which menu to redraw once this field is saved
     }
     await query.message.edit_text(_PROMPTS[key], reply_markup=_prompt_keyboard())
 
@@ -202,9 +261,15 @@ def register_settings_handlers(app: Client) -> None:
             return
 
         if action == "back":
-            _pending.pop(user_id, None)
+            pending = _pending.pop(user_id, None)
             settings = await settings_db.get_settings(user_id)
-            await _render_main(query.message, settings)
+            return_menu = pending.get("menu") if pending else None
+            if return_menu == "metadata":
+                await _render_metadata(query.message, settings)
+            elif return_menu == "swap":
+                await _render_swap(query.message, settings)
+            else:
+                await _render_main(query.message, settings)
             await query.answer()
             return
 
@@ -239,6 +304,40 @@ def register_settings_handlers(app: Client) -> None:
             await query.answer()
             return
 
+        if action == "meta_menu":
+            await _render_metadata(query.message, settings)
+            await query.answer()
+            return
+
+        if action == "meta_global":
+            await _ask_for(query, "metadata_global", menu="metadata")
+            await query.answer()
+            return
+
+        if action == "meta_video":
+            await _ask_for(query, "metadata_video", menu="metadata")
+            await query.answer()
+            return
+
+        if action == "meta_audio":
+            await _ask_for(query, "metadata_audio", menu="metadata")
+            await query.answer()
+            return
+
+        if action == "meta_subtitle":
+            await _ask_for(query, "metadata_subtitle", menu="metadata")
+            await query.answer()
+            return
+
+        if action == "meta_clear":
+            settings = await settings_db.update_settings(
+                user_id, metadata_title=None, metadata_global="", metadata_video="",
+                metadata_audio="", metadata_subtitle="",
+            )
+            await _render_metadata(query.message, settings)
+            await query.answer("Cleared all metadata.")
+            return
+
         if action == "dump":
             await _ask_for(query, "dump_chat_id")
             await query.answer()
@@ -256,7 +355,7 @@ def register_settings_handlers(app: Client) -> None:
             return
 
         if action == "swap_add":
-            await _ask_for(query, "name_swap_pair")
+            await _ask_for(query, "name_swap_pair", menu="swap")
             await query.answer()
             return
 
@@ -373,7 +472,8 @@ def register_settings_handlers(app: Client) -> None:
             await _finish(client, message, pending, settings)
             return
 
-        # Simple text fields: leech_prefix / leech_suffix / leech_caption / metadata_title
+        # Simple text fields: leech_prefix / leech_suffix / leech_caption /
+        # metadata_title / metadata_global / metadata_video / metadata_audio / metadata_subtitle
         new_value = None if value == "-" else value
         settings = await settings_db.update_settings(message.from_user.id, **{key: new_value})
         _pending.pop(message.from_user.id, None)
@@ -381,11 +481,14 @@ def register_settings_handlers(app: Client) -> None:
 
 
 async def _finish(client: Client, message: Message, pending: Dict[str, Any], settings: Dict[str, Any]) -> None:
+    menu = pending.get("menu", "main")
+    text, markup = (
+        (_metadata_menu_text(settings), _metadata_menu_keyboard(settings))
+        if menu == "metadata"
+        else (_main_menu_text(settings), _main_menu_keyboard(settings))
+    )
     try:
-        await client.edit_message_text(
-            pending["chat_id"], pending["message_id"],
-            _main_menu_text(settings), reply_markup=_main_menu_keyboard(settings),
-        )
+        await client.edit_message_text(pending["chat_id"], pending["message_id"], text, reply_markup=markup)
     except Exception:  # noqa: BLE001
         pass
     await _confirm_and_cleanup(client, message, "✅ Saved.")

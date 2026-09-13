@@ -14,7 +14,7 @@ import logging
 import os
 import shutil
 import subprocess
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("leech.metadata")
 
@@ -274,4 +274,147 @@ async def generate_thumbnail(path: str) -> Optional[str]:
         logger.info("Thumbnail generation failed for %s: %s", path, exc)
         return None
 
+    return out_path
+
+
+async def probe_stream_info(path: str) -> List[Dict[str, Any]]:
+    """Returns a list of {'codec_type', 'rel_index', 'language'} for
+    every stream in the file. `rel_index` is the index *within its own
+    type* (e.g. the 2nd audio stream has rel_index 1), matching ffmpeg's
+    `-metadata:s:a:N` stream-specifier numbering. Empty list if ffprobe
+    is unavailable or probing fails."""
+    if not ffprobe_available():
+        return []
+
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "stream=codec_type:stream_tags=language",
+        "-of", "json", path,
+    ]
+
+    def _run() -> bytes:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        return result.stdout
+
+    try:
+        raw = await asyncio.to_thread(_run)
+        data = json.loads(raw or b"{}")
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Stream info probe failed for %s: %s", path, exc)
+        return []
+
+    counters: Dict[str, int] = {}
+    result: List[Dict[str, Any]] = []
+    for stream in data.get("streams", []):
+        codec_type = stream.get("codec_type")
+        if codec_type not in ("video", "audio", "subtitle"):
+            continue
+        rel_index = counters.get(codec_type, 0)
+        counters[codec_type] = rel_index + 1
+        lang = (stream.get("tags") or {}).get("language", "und")
+        result.append({"codec_type": codec_type, "rel_index": rel_index, "language": lang})
+    return result
+
+
+def _parse_metadata_template(template: str, filename: str, extra: Dict[str, str]) -> List[Tuple[str, str]]:
+    """Parses a '/usetting Metadata' template like `Auth=@Channel,
+    title={basename}` into (key, value) pairs, substituting
+    {basename}/{filename} and whatever else is passed in `extra` (e.g.
+    {audiolang}/{sublang}). Malformed chunks (no '=') are skipped rather
+    than raising."""
+    base, _ = os.path.splitext(filename)
+    pairs: List[Tuple[str, str]] = []
+    for chunk in (template or "").split(","):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        key, _, raw_value = chunk.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        try:
+            value = raw_value.strip().format(basename=base, filename=filename, **extra)
+        except (KeyError, IndexError, ValueError):
+            value = raw_value.strip()
+        pairs.append((key, value))
+    return pairs
+
+
+async def embed_custom_metadata(path: str, filename: str, settings: dict) -> str:
+    """Remuxes `path` with the user's /usetting Metadata -> Global /
+    Video / Audio / Subtitle templates applied, all in a single
+    stream-copy pass (fast, lossless):
+
+    - Global applies once to the whole container (ffmpeg `-metadata`),
+      e.g. `Auth=@Channel, title={basename}`.
+    - Video/Audio/Subtitle apply per matching stream (ffmpeg
+      `-metadata:s:v:N` / `:s:a:N` / `:s:s:N`), looping over however many
+      of each the file actually has. The Audio/Subtitle templates can
+      additionally use {audiolang}/{sublang}, filled in with that
+      specific stream's own detected language tag -- e.g.
+      `language={audiolang}, title=@Channel`.
+
+    Falls back to the legacy single metadata_title setting (as a plain
+    global title) if none of the four new fields are set, for anyone
+    upgrading from before this existed. Returns a new path on success, or
+    the original `path` unchanged if there's nothing to apply, ffmpeg is
+    unavailable, or the remux fails -- this never blocks a leech job."""
+    global_tpl = settings.get("metadata_global") or ""
+    video_tpl = settings.get("metadata_video") or ""
+    audio_tpl = settings.get("metadata_audio") or ""
+    subtitle_tpl = settings.get("metadata_subtitle") or ""
+
+    if not any([global_tpl, video_tpl, audio_tpl, subtitle_tpl]) and settings.get("metadata_title"):
+        global_tpl = f"title={settings['metadata_title']}"
+
+    if not any([global_tpl, video_tpl, audio_tpl, subtitle_tpl]):
+        return path
+    if not ffmpeg_available():
+        logger.info("ffmpeg not found on PATH -- skipping metadata for %s", path)
+        return path
+
+    args: List[str] = []
+    for key, value in _parse_metadata_template(global_tpl, filename, {}):
+        args += ["-metadata", f"{key}={value}"]
+
+    if video_tpl or audio_tpl or subtitle_tpl:
+        for s in await probe_stream_info(path):
+            if s["codec_type"] == "video" and video_tpl:
+                for key, value in _parse_metadata_template(video_tpl, filename, {}):
+                    args += [f"-metadata:s:v:{s['rel_index']}", f"{key}={value}"]
+            elif s["codec_type"] == "audio" and audio_tpl:
+                extra = {"audiolang": s["language"], "audiolang_name": _readable_lang(s["language"])}
+                for key, value in _parse_metadata_template(audio_tpl, filename, extra):
+                    args += [f"-metadata:s:a:{s['rel_index']}", f"{key}={value}"]
+            elif s["codec_type"] == "subtitle" and subtitle_tpl:
+                extra = {"sublang": s["language"], "sublang_name": _readable_lang(s["language"])}
+                for key, value in _parse_metadata_template(subtitle_tpl, filename, extra):
+                    args += [f"-metadata:s:s:{s['rel_index']}", f"{key}={value}"]
+
+    if not args:
+        return path
+
+    out_path = path + ".meta" + os.path.splitext(path)[1]
+    cmd = ["ffmpeg", "-y", "-i", path, "-map", "0", "-c", "copy", *args, out_path]
+
+    def _run() -> None:
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+        if result.returncode != 0 or not os.path.exists(out_path):
+            raise RuntimeError(result.stderr.decode(errors="ignore")[-500:])
+
+    try:
+        await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Custom metadata embed failed for %s: %s", path, exc)
+        try:
+            if os.path.exists(out_path):
+                os.remove(out_path)
+        except OSError:
+            pass
+        return path
+
+    try:
+        os.remove(path)
+    except OSError:
+        pass
     return out_path

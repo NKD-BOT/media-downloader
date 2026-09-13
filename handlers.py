@@ -531,11 +531,16 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
         if corrected_ext:
             filename = os.path.splitext(filename)[0] + corrected_ext
 
-    # ---- Optional metadata-title embed (audio/video only, via ffmpeg) ----
-    if settings.get("metadata_title") and metadata_mod.is_media_file(filename):
+    # ---- Optional custom metadata embed (Global/Video/Audio/Subtitle
+    # templates from /usetting -> Metadata, audio/video files only, via
+    # ffmpeg) ----
+    has_metadata = any(
+        settings.get(k) for k in ("metadata_title", "metadata_global", "metadata_video", "metadata_audio", "metadata_subtitle")
+    )
+    if has_metadata and metadata_mod.is_media_file(filename):
         job.phase = "splitting"  # reuse an existing, harmless status label
         await _safe_edit(status_msg, "🏷 Embedding metadata...")
-        dest_path = await metadata_mod.embed_title(dest_path, settings["metadata_title"])
+        dest_path = await metadata_mod.embed_custom_metadata(dest_path, filename, settings)
 
     final_size = os.path.getsize(dest_path)
     await _safe_edit(status_msg, f"✅ Downloaded {human_size(final_size)}. Preparing upload...")
@@ -756,10 +761,14 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
             if corrected_ext:
                 name = os.path.splitext(name)[0] + corrected_ext
 
-        # Optional metadata-title embed (audio/video only, via ffmpeg) --
-        # done before the size check since a remux can change the size.
-        if settings.get("metadata_title") and metadata_mod.is_media_file(name):
-            file_path = await metadata_mod.embed_title(file_path, settings["metadata_title"])
+        # Optional custom metadata embed (Global/Video/Audio/Subtitle
+        # templates, audio/video only, via ffmpeg) -- done before the
+        # size check since a remux can change the size.
+        has_metadata = any(
+            settings.get(k) for k in ("metadata_title", "metadata_global", "metadata_video", "metadata_audio", "metadata_subtitle")
+        )
+        if has_metadata and metadata_mod.is_media_file(name):
+            file_path = await metadata_mod.embed_custom_metadata(file_path, name, settings)
 
         size = os.path.getsize(file_path)
 
