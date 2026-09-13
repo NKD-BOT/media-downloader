@@ -130,15 +130,30 @@ def split_path_parts(total_size: int, part_size: int) -> int:
 
 
 def apply_naming(filename: str, settings: dict) -> str:
-    """Applies a user's /usetting name-swap find/replace pairs (if
-    enabled), then their prefix/suffix, to a filename -- extension is
-    preserved untouched throughout."""
+    """Applies a user's /usetting name-swap patterns (if enabled), then
+    their prefix/suffix, to a filename -- extension is preserved
+    untouched throughout.
+
+    Name-swap patterns are regular expressions (re.sub, case-insensitive),
+    not plain substrings -- a plain site name like "Vegamovies" still
+    matches exactly like a literal replace would, but this also lets a
+    pattern like a full URL regex strip arbitrarily-varying text (which a
+    literal find/replace could never do). An empty replacement removes
+    the match entirely. Invalid regexes are skipped rather than crashing
+    the leech. After all patterns are applied, repeated separators left
+    behind by removed words (e.g. "Movie..2023..mkv") are collapsed."""
     base, ext = os.path.splitext(filename)
 
     if settings.get("name_swap_enabled"):
         for pair in settings.get("name_swap_pairs", []):
             if len(pair) == 2 and pair[0]:
-                base = base.replace(pair[0], pair[1])
+                try:
+                    base = re.sub(pair[0], pair[1], base, flags=re.IGNORECASE)
+                except re.error:
+                    continue  # invalid regex -- skip rather than break the leech
+        # Tidy up leftover separator runs (".. ", "--", etc.) from removed words
+        base = re.sub(r"[.\-_ ]{2,}", ".", base)
+        base = base.strip(" .-_")
 
     prefix = settings.get("leech_prefix") or ""
     suffix = settings.get("leech_suffix") or ""

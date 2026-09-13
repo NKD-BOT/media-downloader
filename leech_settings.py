@@ -16,6 +16,7 @@ in-progress prompt.
 import asyncio
 import logging
 import os
+import re
 from typing import Any, Dict, Optional
 
 from pyrogram import Client, filters
@@ -47,7 +48,14 @@ _PROMPTS = {
     ),
     "metadata_title": "Send the *metadata title* to embed into video/audio files (requires ffmpeg), or `-` to clear it.",
     "dump_chat_id": "Send the *dump chat ID* every leeched file should also be copied to (the bot must already be a member/admin there), or `-` to clear it.",
-    "name_swap_pair": "Send the pair to swap as `find::replace`, e.g. `S01::Season 1`.",
+    "name_swap_pair": (
+        "Send one or more patterns to strip/replace, as `find:::replace`. "
+        "Add several at once by separating them with `|`.\n"
+        "Leave the replacement empty to just remove a match, e.g. `Vegamovies:::`.\n"
+        "Patterns are regular expressions (case-insensitive), so this also works: "
+        "`(www\\.[^\\s/$.?#].[^\\s]*):::`\n"
+        "Example: `Vegamovies:::|ExtraFlix:::|4kHdHub:::|(www\\.[^\\s/$.?#].[^\\s]*):::`"
+    ),
     "thumbnail": "Send a *photo* to use as the new thumbnail, or send `-` to remove the current one.",
 }
 
@@ -308,11 +316,36 @@ def register_settings_handlers(app: Client) -> None:
             return
 
         if key == "name_swap_pair":
-            if "::" not in value:
-                await message.reply_text("Format must be `find::replace` (with the double colon).")
+            entries = [e for e in value.split("|") if e.strip()]
+            valid: list = []
+            skipped = 0
+            for entry in entries:
+                parts = re.split(r":{2,}", entry, maxsplit=1)  # tolerate "::" or ":::"
+                if len(parts) != 2:
+                    skipped += 1
+                    continue
+                find, replace = parts
+                find = find.strip()
+                if not find:
+                    skipped += 1
+                    continue
+                try:
+                    re.compile(find)
+                except re.error:
+                    skipped += 1
+                    continue
+                valid.append((find, replace.strip()))
+
+            if not valid:
+                await message.reply_text(
+                    "No valid patterns found. Format is `find:::replace` "
+                    "(separate several with `|`), and `find` must be a valid regex."
+                )
                 return
-            find, replace = value.split("::", 1)
-            settings = await settings_db.add_name_swap_pair(message.from_user.id, find.strip(), replace.strip())
+
+            settings = await settings_db.add_name_swap_pairs(message.from_user.id, valid)
+            if not settings.get("name_swap_enabled"):
+                settings = await settings_db.update_settings(message.from_user.id, name_swap_enabled=True)
             _pending.pop(message.from_user.id, None)
             try:
                 await client.edit_message_text(
@@ -321,7 +354,10 @@ def register_settings_handlers(app: Client) -> None:
                 )
             except Exception:  # noqa: BLE001
                 pass
-            await _confirm_and_cleanup(client, message, "✅ Pair added.")
+            confirm_text = f"✅ Added {len(valid)} pair(s), name swap turned on."
+            if skipped:
+                confirm_text += f" Skipped {skipped} invalid entrie(s)."
+            await _confirm_and_cleanup(client, message, confirm_text)
             return
 
         if key == "dump_chat_id":

@@ -37,13 +37,14 @@ from pyrogram.errors import RPCError, FloodWait
 
 import config
 import settings_db
+import mongo_db
 import metadata as metadata_mod
 from uploader import upload_file
 from leech_settings import pop_pending
 from downloader import Job, download_file, split_file, cleanup_paths, is_safe_url, DownloadError, Cancelled
 from torrent import (
     TorrentJob, TorrentError, TorrentCancelled, is_torrent_source,
-    torrent_support_enabled, torrent_disabled_reason, add_torrent, wait_for_metadata, poll_progress,
+    torrent_support_enabled, torrent_disabled_reason, aria2_available, add_torrent, wait_for_metadata, poll_progress,
 )
 from utils import (
     format_status_block, human_size, filename_from_response, split_path_parts,
@@ -124,6 +125,10 @@ def _stop_keyboard(job: "AnyJob") -> InlineKeyboardMarkup:
 
 def _user_mention(message: Message) -> str:
     return message.from_user.mention if message.from_user else "Unknown"
+
+
+def _username(message: Message) -> Optional[str]:
+    return message.from_user.username if message.from_user else None
 
 
 def _status_label(job: "AnyJob") -> str:
@@ -224,6 +229,59 @@ def register_handlers(app: Client) -> None:
             "/usetting — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap"
         )
 
+    @app.on_message(filters.command("stats"))
+    async def stats_cmd(client: Client, message: Message):
+        if not mongo_db.mongo_enabled():
+            await message.reply_text(
+                "📊 Stats require MongoDB (set DB_URI) -- without it, only your "
+                "/usetting preferences are saved (to a local file), not usage history."
+            )
+            return
+        stats = await mongo_db.get_stats(message.from_user.id)
+        if not stats:
+            await message.reply_text("No leech history yet -- try /leech something first!")
+            return
+        files = stats.get("files_leeched", 0)
+        total_bytes = stats.get("bytes_leeched", 0)
+        first_seen = stats.get("first_seen")
+        first_seen_str = first_seen.strftime("%Y-%m-%d") if first_seen else "—"
+        await message.reply_text(
+            f"📊 *Your stats*\n\n"
+            f"Files leeched: {files}\n"
+            f"Total data: {human_size(total_bytes)}\n"
+            f"First used: {first_seen_str}"
+        )
+
+    @app.on_message(filters.command("sysinfo"))
+    async def sysinfo_cmd(client: Client, message: Message):
+        # Diagnostic command: helps figure out *why* something like the
+        # {languages}/{subtitles} caption placeholders or metadata-title
+        # embedding isn't working -- e.g. because a host is building this
+        # bot via a builder (like Railway's Nixpacks auto-detection) that
+        # skips the Dockerfile's `apt-get install ffmpeg`, silently
+        # leaving ffmpeg/ffprobe missing even though the code is fine.
+        def check(ok: bool) -> str:
+            return "✅ available" if ok else "❌ NOT found"
+
+        lines = [
+            "🔧 *System check*",
+            "",
+            f"ffmpeg: {check(metadata_mod.ffmpeg_available())}",
+            f"ffprobe: {check(metadata_mod.ffprobe_available())}",
+            f"aria2c: {check(aria2_available())}",
+            f"TORRENT_ENABLED: {'true' if config.TORRENT_ENABLED else 'false'}",
+            f"MongoDB: {'✅ enabled (DB_URI set)' if mongo_db.mongo_enabled() else 'disabled (using local JSON file)'}",
+        ]
+        if not metadata_mod.ffmpeg_available() or not metadata_mod.ffprobe_available():
+            lines.append(
+                "\n⚠️ ffmpeg/ffprobe missing means: no metadata-title embedding, "
+                "no auto-thumbnails/duration on videos, and {languages}/{subtitles} "
+                "in captions will always show N/A. If you're on Railway, check that "
+                "the service's Builder is set to *Dockerfile*, not Nixpacks -- "
+                "Nixpacks skips the `apt-get install ffmpeg` step entirely."
+            )
+        await message.reply_text("\n".join(lines))
+
     @app.on_message(filters.command("help"))
     async def help_cmd(client: Client, message: Message):
         torrent_line = (
@@ -239,7 +297,9 @@ def register_handlers(app: Client) -> None:
             "`/leech` (as a reply to an uploaded `.torrent` file) — same, from that file\n"
             "`/cancel` — cancel your in-progress job\n"
             "`/status` — show progress of your current job\n"
-            "`/usetting` — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap\n\n"
+            "`/usetting` — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap\n"
+            "`/stats` — your total files leeched and data downloaded (needs MongoDB)\n"
+            "`/sysinfo` — check if ffmpeg/ffprobe/aria2c/MongoDB are available on this deployment\n\n"
             f"Max file size before splitting: {config.MAX_FILE_SIZE_MB} MB\n"
             f"{torrent_line}\n\n"
             "Pages that require login/JavaScript to reveal the real file URL "
@@ -586,6 +646,7 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
         shutil.rmtree(dest_path + "_extracted", ignore_errors=True)
     job.phase = "done"
     total_time = time.time() - download_start
+    await mongo_db.record_leech(job.user_id, _username(message), final_size)
     await _safe_edit(
         status_msg,
         f"✅ Done! {human_size(final_size)} in {int(total_time)}s"
@@ -677,6 +738,7 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
                 expanded.extend(p for p, _ in extracted)
         files_to_process = expanded
 
+    torrent_total_bytes = job.total  # capture before job.total gets reused per-file below
     job.phase = "uploading"
     asyncio.create_task(_run_status_loop(status_msg, job, {"uploading"}, "Telegram Upload", "#Leech", _user_mention(message)))
     upload_plan = []  # list of (path, display_name)
@@ -771,4 +833,5 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
         shutil.rmtree(d, ignore_errors=True)
 
     job.phase = "done"
+    await mongo_db.record_leech(job.user_id, _username(message), torrent_total_bytes)
     await _safe_edit(status_msg, f"✅ Done! Uploaded {job.upload_count} file(s) from the torrent.")

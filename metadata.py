@@ -95,12 +95,39 @@ async def embed_title(path: str, title: str) -> str:
     return out_path
 
 
+# Common ISO 639-1/639-2 language codes -> readable names, since ffprobe
+# reports raw tags like "hin"/"eng" but captions look much nicer showing
+# "Hindi"/"English" (matching what most reference leech bots display).
+_LANGUAGE_NAMES = {
+    "eng": "English", "hin": "Hindi", "tam": "Tamil", "tel": "Telugu",
+    "kan": "Kannada", "mal": "Malayalam", "ben": "Bengali", "guj": "Gujarati",
+    "mar": "Marathi", "pan": "Punjabi", "urd": "Urdu", "ori": "Odia",
+    "asm": "Assamese", "spa": "Spanish", "fre": "French", "fra": "French",
+    "ger": "German", "deu": "German", "ita": "Italian", "por": "Portuguese",
+    "rus": "Russian", "chi": "Chinese", "zho": "Chinese", "jpn": "Japanese",
+    "kor": "Korean", "ara": "Arabic", "tur": "Turkish", "vie": "Vietnamese",
+    "tha": "Thai", "ind": "Indonesian", "nld": "Dutch", "dut": "Dutch",
+    "pol": "Polish", "ukr": "Ukrainian", "swe": "Swedish", "nor": "Norwegian",
+    "dan": "Danish", "fin": "Finnish", "heb": "Hebrew", "gre": "Greek", "ell": "Greek",
+}
+
+
+def _readable_lang(tag: str) -> str:
+    tag = (tag or "und").strip().lower()
+    if tag in ("und", "unk", ""):
+        return "Unknown"
+    return _LANGUAGE_NAMES.get(tag, tag.upper())
+
+
 async def probe_tracks(path: str) -> Dict[str, List[str]]:
-    """Returns {"languages": [...], "subtitles": [...]} -- the language
-    tags of every embedded audio / subtitle track, via `ffprobe`. Powers
-    the {languages}/{subtitles} placeholders in a /usetting leech caption.
-    Empty lists if ffprobe is missing, the file isn't recognized media, or
-    probing fails -- this never blocks a leech job."""
+    """Returns {"languages": [...], "subtitles": [...]} -- readable
+    language names (e.g. "Hindi", "English") for every embedded audio /
+    subtitle track, via `ffprobe`. Powers the {languages}/{subtitles}
+    placeholders in a /usetting leech caption. Empty lists if ffprobe is
+    missing, the file isn't recognized media, or probing fails -- this
+    never blocks a leech job. (Run /sysinfo to check whether ffprobe is
+    actually installed on this deployment if these always come back
+    empty.)"""
     if not ffprobe_available() or not is_media_file(path):
         return {"languages": [], "subtitles": []}
 
@@ -124,7 +151,7 @@ async def probe_tracks(path: str) -> Dict[str, List[str]]:
     languages: List[str] = []
     subtitles: List[str] = []
     for stream in data.get("streams", []):
-        lang = (stream.get("tags") or {}).get("language", "und")
+        lang = _readable_lang((stream.get("tags") or {}).get("language", "und"))
         codec_type = stream.get("codec_type")
         if codec_type == "audio":
             languages.append(lang)

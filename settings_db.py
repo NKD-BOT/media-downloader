@@ -1,9 +1,11 @@
 """
 settings_db.py
-Lightweight per-user "Leech Settings" storage, backed by a single JSON
-file on disk -- no external database service required. All access goes
-through an asyncio.Lock since every Pyrogram handler shares one event
-loop, and writes are atomic (write to a temp file, then os.replace).
+Per-user "Leech Settings" storage. Uses MongoDB (via mongo_db.py)
+automatically whenever DB_URI is configured; otherwise falls back to a
+single local JSON file -- no external database service required either
+way. Every other module (handlers.py, leech_settings.py) only ever calls
+the functions here, so the storage backend is an implementation detail
+they don't need to know about.
 
 Settings stored here power the /usetting menu: filename prefix/suffix,
 a caption template, a custom thumbnail, native-media vs. document
@@ -16,6 +18,8 @@ import json
 import logging
 import os
 from typing import Any, Dict, List, Tuple
+
+import mongo_db
 
 logger = logging.getLogger("leech.settings_db")
 
@@ -56,12 +60,28 @@ def _save_all(data: Dict[str, Dict[str, Any]]) -> None:
 async def get_settings(user_id: int) -> Dict[str, Any]:
     """Returns this user's settings merged over the defaults (so newly
     added setting keys always have a sane value even for old records)."""
+    if mongo_db.mongo_enabled():
+        doc = await mongo_db.get_settings(user_id)
+        if doc is not None:
+            doc.pop("_id", None)
+            return {**DEFAULTS, **doc}
+        return dict(DEFAULTS)
+
     async with _lock:
         data = _load_all()
         return {**DEFAULTS, **data.get(str(user_id), {})}
 
 
 async def update_settings(user_id: int, **changes: Any) -> Dict[str, Any]:
+    if mongo_db.mongo_enabled():
+        current = await get_settings(user_id)
+        current.update(changes)
+        saved = await mongo_db.save_settings(user_id, current)
+        if saved:
+            return current
+        # Mongo write failed (e.g. connection drop) -- don't silently lose
+        # the change, fall through to the JSON store as a safety net.
+
     async with _lock:
         data = _load_all()
         key = str(user_id)
@@ -73,16 +93,17 @@ async def update_settings(user_id: int, **changes: Any) -> Dict[str, Any]:
 
 
 async def add_name_swap_pair(user_id: int, find: str, replace: str) -> Dict[str, Any]:
-    async with _lock:
-        data = _load_all()
-        key = str(user_id)
-        current = {**DEFAULTS, **data.get(key, {})}
-        pairs: List[List[str]] = list(current.get("name_swap_pairs", []))
-        pairs.append([find, replace])
-        current["name_swap_pairs"] = pairs
-        data[key] = current
-        _save_all(data)
-        return current
+    return await add_name_swap_pairs(user_id, [(find, replace)])
+
+
+async def add_name_swap_pairs(user_id: int, pairs: List[Tuple[str, str]]) -> Dict[str, Any]:
+    """Adds several name-swap pairs in a single read-modify-write round
+    trip -- used by the /usetting bulk-paste flow so adding 50 site-name
+    filters doesn't mean 50 separate DB writes."""
+    current = await get_settings(user_id)
+    existing: List[List[str]] = list(current.get("name_swap_pairs", []))
+    existing.extend([list(p) for p in pairs])
+    return await update_settings(user_id, name_swap_pairs=existing)
 
 
 async def clear_name_swap_pairs(user_id: int) -> Dict[str, Any]:

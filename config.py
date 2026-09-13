@@ -86,6 +86,15 @@ ARIA2_RPC_SECRET: str = os.getenv("ARIA2_RPC_SECRET", "")
 # (file list) before giving up and proceeding anyway.
 TORRENT_METADATA_TIMEOUT_SECONDS: int = _get_int("TORRENT_METADATA_TIMEOUT_SECONDS", 60)
 
+# ---- MongoDB (optional) ----
+# If DB_URI is set, per-user /usetting preferences and leech stats
+# (files leeched, total data, first/last used) persist in MongoDB
+# instead of the local user_settings.json file, and /stats becomes
+# available. Leave DB_URI empty to keep using the JSON file -- no
+# MongoDB server required for the bot to work.
+DB_URI: str = os.getenv("DB_URI", "")
+DB_NAME: str = os.getenv("DB_NAME", "leech_bot")
+
 
 def validate_required_for_runtime() -> None:
     missing = []
