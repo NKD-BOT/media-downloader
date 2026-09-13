@@ -55,8 +55,13 @@ def is_media_file(path: str) -> bool:
 async def embed_title(path: str, title: str) -> str:
     """Remuxes `path` with an embedded metadata title tag. Returns the
     path to actually upload: a new `<name>.meta<ext>` file on success, or
-    the original `path` unchanged if embedding wasn't possible/failed."""
-    if not title or not is_media_file(path):
+    the original `path` unchanged if embedding wasn't possible/failed.
+    Callers are expected to have already checked the file's real/intended
+    name looks like media (is_media_file on the *display* name) -- this
+    function doesn't re-check by `path`'s own extension, since `path` is
+    often a generic temp filename (e.g. ending in .tmp) that would never
+    match regardless of what the file actually contains."""
+    if not title:
         return path
     if not ffmpeg_available():
         logger.info("ffmpeg not found on PATH -- skipping metadata embed for %s", path)
@@ -128,7 +133,7 @@ async def probe_tracks(path: str) -> Dict[str, List[str]]:
     never blocks a leech job. (Run /sysinfo to check whether ffprobe is
     actually installed on this deployment if these always come back
     empty.)"""
-    if not ffprobe_available() or not is_media_file(path):
+    if not ffprobe_available():
         return {"languages": [], "subtitles": []}
 
     cmd = [
