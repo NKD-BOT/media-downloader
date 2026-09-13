@@ -75,7 +75,7 @@ MAX_CONCURRENT_JOBS_PER_USER: int = 1
 # acceptable-use policy disallows torrenting; direct-link /leech and
 # everything else keeps working normally. The torrent code itself is
 # untouched -- just flip this back to true to turn it on again.
-TORRENT_ENABLED: bool = _get_bool("TORRENT_ENABLED", True)
+TORRENT_ENABLED: bool = _get_bool("TORRENT_ENABLED", false)
 # Port the bot's own private aria2c RPC daemon listens on. Only needs to
 # be reachable from this process, not exposed publicly.
 ARIA2_RPC_PORT: int = _get_int("ARIA2_RPC_PORT", 6800)
