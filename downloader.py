@@ -13,6 +13,7 @@ import time
 import socket
 import ipaddress
 import logging
+import uuid
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional
 from urllib.parse import urlparse
@@ -94,6 +95,11 @@ class Job:
     upload_index: int = 0
     upload_count: int = 1
     start_time: float = field(default_factory=time.time)
+    # Unique per-job token so an old Stop button left over from a previous,
+    # already-finished job can't accidentally cancel a brand new one --
+    # Telegram buttons stay tappable forever, but they only carry the
+    # user_id unless we also check this.
+    token: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
 
 async def download_file(job: Job, url: str, dest_path: str, on_progress: ProgressCallback) -> None:

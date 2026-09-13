@@ -167,3 +167,79 @@ async def detect_real_container(path: str) -> Optional[str]:
         return None
 
     return _FORMAT_NAME_TO_EXT.get(format_name)
+
+
+async def probe_video_info(path: str) -> Optional[Dict[str, int]]:
+    """Returns {'duration': seconds, 'width': px, 'height': px} for a
+    video file via ffprobe, or None if ffprobe is unavailable, the file
+    has no video stream, or probing fails.
+
+    Without these, Telegram clients often show a video with a blank
+    preview and a "0:00" duration even though the file itself plays
+    perfectly fine once opened -- passing them on upload fixes that."""
+    if not ffprobe_available():
+        return None
+
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height:format=duration",
+        "-of", "json", path,
+    ]
+
+    def _run() -> bytes:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30)
+        return result.stdout
+
+    try:
+        raw = await asyncio.to_thread(_run)
+        data = json.loads(raw or b"{}")
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Video info probe failed for %s: %s", path, exc)
+        return None
+
+    streams = data.get("streams") or [{}]
+    fmt = data.get("format") or {}
+    width = streams[0].get("width")
+    height = streams[0].get("height")
+    if not width or not height:
+        return None
+    try:
+        duration = int(float(fmt.get("duration", 0)))
+    except (TypeError, ValueError):
+        duration = 0
+
+    return {"duration": duration, "width": int(width), "height": int(height)}
+
+
+async def generate_thumbnail(path: str) -> Optional[str]:
+    """Extracts a single frame from a video as a JPEG thumbnail, for
+    uploads where the user hasn't set a custom /usetting thumbnail --
+    without any thumbnail at all, Telegram's own auto-generation is
+    unreliable and often leaves the preview blank. Returns the new
+    thumbnail's path, or None if ffmpeg is unavailable or extraction
+    fails (never blocks the leech itself). The caller is responsible for
+    deleting the returned path after the upload -- unlike a user's
+    persistent /usetting thumbnail, this one is single-use."""
+    if not ffmpeg_available():
+        return None
+
+    out_path = path + "_thumb.jpg"
+    cmd = [
+        "ffmpeg", "-y", "-ss", "00:00:01", "-i", path,
+        "-frames:v", "1", "-vf", "scale=320:-1",
+        out_path,
+    ]
+
+    def _run() -> None:
+        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=60)
+        if result.returncode != 0 or not os.path.exists(out_path):
+            raise RuntimeError(result.stderr.decode(errors="ignore")[-300:])
+
+    try:
+        await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Thumbnail generation failed for %s: %s", path, exc)
+        return None
+
+    return out_path

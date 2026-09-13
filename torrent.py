@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -158,6 +159,9 @@ class TorrentJob:
     upload_count: int = 1
     seeders: int = 0
     connections: int = 0
+    # Unique per-job token so an old Stop button left over from a previous,
+    # already-finished job can't accidentally cancel a brand new one.
+    token: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
 
 async def add_torrent(job: TorrentJob, source: str, torrent_file_path: Optional[str] = None) -> None:

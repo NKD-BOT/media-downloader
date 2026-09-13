@@ -26,11 +26,19 @@ async def upload_file(
     thumb: Optional[str],
     send_as_document: bool,
     progress: Callable[[int, int], None],
+    duration: int = 0,
+    width: int = 0,
+    height: int = 0,
 ) -> Message:
     """Sends `path` as a reply in `message`'s chat. Falls back to a plain
     document if a native-media send is attempted but rejected by Telegram
     (e.g. a mislabeled/corrupt video), so a leech never fails outright
-    just because of the media-type guess."""
+    just because of the media-type guess.
+
+    duration/width/height (when known, e.g. via metadata.probe_video_info)
+    are passed straight to Telegram -- without them, clients often show a
+    blank preview and a "0:00" duration for an otherwise perfectly playable
+    video."""
     ext = os.path.splitext(file_name)[1].lower()
     thumb_arg = thumb if (thumb and os.path.exists(thumb)) else None
 
@@ -41,11 +49,13 @@ async def upload_file(
             if ext in _VIDEO_EXTS:
                 return await message.reply_video(
                     path, file_name=file_name, thumb=thumb_arg,
+                    duration=duration, width=width, height=height,
                     caption=caption, progress=progress,
                 )
             if ext in _AUDIO_EXTS:
                 return await message.reply_audio(
                     path, file_name=file_name, thumb=thumb_arg,
+                    duration=duration,
                     caption=caption, progress=progress,
                 )
             if ext in _PHOTO_EXTS:

@@ -89,8 +89,37 @@ async def _build_media_caption(path: str, name: str, settings: dict) -> str:
     return build_caption(name, os.path.getsize(path), template, languages=languages, subtitles=subtitles)
 
 
-def _stop_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop", callback_data=f"cancel:{user_id}")]])
+_VIDEO_EXTS_FOR_PROBE = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv", ".m4v"}
+
+
+async def _prepare_video_extras(path: str, name: str, settings: dict) -> Tuple[dict, Optional[str], Optional[str]]:
+    """For a native video upload, probes duration/width/height and (if the
+    user hasn't set a custom /usetting thumbnail) auto-extracts a frame to
+    use instead -- without these, Telegram often shows a blank preview and
+    a "0:00" duration even though the video itself plays perfectly fine.
+
+    Returns (extra_kwargs_for_upload_file, thumb_path_to_use,
+    generated_thumb_to_delete_afterward). The third value is None when the
+    thumbnail came from the user's persistent /usetting setting instead of
+    being freshly generated -- only a freshly generated one should be
+    deleted once the upload is done."""
+    ext = os.path.splitext(name)[1].lower()
+    if settings.get("send_as_document") or ext not in _VIDEO_EXTS_FOR_PROBE:
+        return {}, settings.get("thumbnail_path"), None
+
+    extras: dict = await metadata_mod.probe_video_info(path) or {}
+
+    thumb_path = settings.get("thumbnail_path")
+    generated_thumb = None
+    if not thumb_path:
+        generated_thumb = await metadata_mod.generate_thumbnail(path)
+        thumb_path = generated_thumb
+
+    return extras, thumb_path, generated_thumb
+
+
+def _stop_keyboard(job: "AnyJob") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop", callback_data=f"cancel:{job.user_id}:{job.token}")]])
 
 
 def _user_mention(message: Message) -> str:
@@ -131,7 +160,7 @@ async def _run_status_loop(status_msg: Message, job: "AnyJob", phases: set, engi
                 engine=engine, mode=mode, user_mention=user_mention, user_id=job.user_id,
                 seeders=seeders, leechers=leechers,
             )
-            await _safe_edit(status_msg, text, reply_markup=_stop_keyboard(job.user_id))
+            await _safe_edit(status_msg, text, reply_markup=_stop_keyboard(job))
         except Exception:  # noqa: BLE001
             logger.exception("Status loop failed for user %s -- will retry next tick.", job.user_id)
         await asyncio.sleep(config.PROGRESS_EDIT_INTERVAL_SECONDS)
@@ -241,17 +270,23 @@ def register_handlers(app: Client) -> None:
             engine=engine, mode="#Leech", user_mention=_user_mention(message), user_id=job.user_id,
             seeders=seeders, leechers=leechers,
         )
-        await message.reply_text(text, reply_markup=_stop_keyboard(job.user_id))
+        await message.reply_text(text, reply_markup=_stop_keyboard(job))
 
-    @app.on_callback_query(filters.regex(r"^cancel:(\d+)$"))
+    @app.on_callback_query(filters.regex(r"^cancel:(\d+):(\w+)$"))
     async def cancel_callback(client: Client, query: CallbackQuery):
-        target_id = int(query.data.split(":", 1)[1])
+        _, target_id_str, token = query.data.split(":", 2)
+        target_id = int(target_id_str)
         if query.from_user.id != target_id and not (config.OWNER_ID and query.from_user.id == config.OWNER_ID):
             await query.answer("This isn't your job.", show_alert=True)
             return
         job = _active_jobs.get(target_id)
         if not job:
             await query.answer("No active job (already finished?).", show_alert=True)
+            return
+        if job.token != token:
+            # This Stop button belongs to an old, already-finished job --
+            # never let it cancel whatever the user's current job is.
+            await query.answer("This job has already finished.", show_alert=True)
             return
         job.cancelled = True
         await query.answer("🛑 Cancelling...")
@@ -524,13 +559,15 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
             job.total = total
 
         caption = await _build_media_caption(path, name, settings)
+        extras, thumb_path, generated_thumb = await _prepare_video_extras(path, name, settings)
         try:
             sent = await upload_file(
                 message, path, name,
                 caption=caption,
-                thumb=settings.get("thumbnail_path"),
+                thumb=thumb_path,
                 send_as_document=settings.get("send_as_document", False),
                 progress=upload_progress,
+                **extras,
             )
         except RPCError as exc:
             cleanup_paths(paths_to_upload)
@@ -538,6 +575,9 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
                 shutil.rmtree(dest_path + "_extracted", ignore_errors=True)
             await _safe_edit(status_msg, f"⚠️ Upload failed on part {i}/{job.upload_count}: {exc}")
             return
+        finally:
+            if generated_thumb:
+                cleanup_paths([generated_thumb])
 
         await _copy_to_dump(client, sent, settings.get("dump_chat_id"))
 
@@ -709,19 +749,23 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
             job.total = total
 
         caption = await _build_media_caption(path, name, settings)
+        extras, thumb_path, generated_thumb = await _prepare_video_extras(path, name, settings)
         try:
             sent = await upload_file(
                 message, path, name,
                 caption=caption,
-                thumb=settings.get("thumbnail_path"),
+                thumb=thumb_path,
                 send_as_document=settings.get("send_as_document", False),
                 progress=upload_progress,
+                **extras,
             )
             await _copy_to_dump(client, sent, settings.get("dump_chat_id"))
         except RPCError as exc:
             await _safe_edit(status_msg, f"⚠️ Upload failed on {name}: {exc}")
         finally:
             cleanup_paths([path])
+            if generated_thumb:
+                cleanup_paths([generated_thumb])
 
     for d in extract_dirs:
         shutil.rmtree(d, ignore_errors=True)
