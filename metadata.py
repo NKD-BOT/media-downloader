@@ -402,7 +402,14 @@ async def embed_custom_metadata(path: str, filename: str, settings: dict) -> Tup
     if not args:
         return path, None
 
-    out_path = path + ".meta" + os.path.splitext(path)[1]
+    # Use the *display* filename's extension for the output path, not the
+    # disk temp file's (which is usually a generic ".tmp") -- ffmpeg needs
+    # a real container extension (.mkv, .mp4, ...) to pick the right
+    # muxer, or it fails immediately with "Unable to choose an output
+    # format". Falls back to .mkv (a safe default for Matroska sources)
+    # if even the display name has no recognizable extension.
+    real_ext = os.path.splitext(filename)[1] or ".mkv"
+    out_path = path + ".meta" + real_ext
     cmd = ["ffmpeg", "-y", "-i", path, "-map", "0", "-c", "copy", *args, out_path]
     logger.info("Metadata embed command: %s", " ".join(cmd))
 
