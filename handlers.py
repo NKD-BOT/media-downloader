@@ -39,6 +39,7 @@ from pyrogram.errors import RPCError, FloodWait
 import config
 import settings_db
 import mongo_db
+import auth_db
 import metadata as metadata_mod
 from uploader import upload_file
 from leech_settings import pop_pending
@@ -64,6 +65,31 @@ def is_allowed(user_id: int) -> bool:
     if not config.ALLOWED_USER_IDS:
         return True  # no allowlist configured -> open to anyone who can message the bot
     return user_id in config.ALLOWED_USER_IDS
+
+
+def _is_owner(user_id: int) -> bool:
+    return bool(config.OWNER_ID) and user_id == config.OWNER_ID
+
+
+def _check_leech_access(message: Message) -> Optional[str]:
+    """Gatekeeper specifically for /leech (not /help, /status, etc.):
+    - In the bot's PM, only the owner can leech.
+    - In a group/supergroup, nobody can leech until the owner has
+      authorized that specific chat with /a -- once authorized, the
+      existing is_allowed() user allowlist (if any) still applies.
+    Returns None if allowed, or the message to show the user if not."""
+    user_id = message.from_user.id if message.from_user else 0
+
+    if message.chat.type == ChatType.PRIVATE:
+        if _is_owner(user_id):
+            return None
+        return "⛔ This bot only leeches for its owner in PM. Ask the owner to authorize a group with /a instead."
+
+    if _is_owner(user_id):
+        return None
+    if not auth_db.is_authorized(message.chat.id):
+        return "⛔ This group isn't authorized yet. Ask the bot owner to run /a here."
+    return None
 
 
 async def _safe_edit(message: Message, text: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
@@ -253,7 +279,7 @@ def register_handlers(app: Client) -> None:
             "split into parts and uploaded one after another.\n\n"
             "/cancel — stop your current download/upload\n"
             "/status — see progress of your current job\n"
-            "/usetting — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap"
+            "/usetting (or /us) — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap"
         )
 
     @app.on_message(filters.command("stats"))
@@ -316,6 +342,7 @@ def register_handlers(app: Client) -> None:
             if torrent_support_enabled()
             else f"Torrent/magnet support: disabled ⚠️ ({torrent_disabled_reason()})"
         )
+        owner_line = "\n`/a` — authorize/de-authorize *this* group for /leech (owner-only)\n" if _is_owner(message.from_user.id if message.from_user else 0) else ""
         await message.reply_text(
             "`/leech <url> [filename]` — download a direct link and upload it here (`/l` shortcut also works)\n"
             "`/leech <url> -e` — download a .zip and upload its extracted contents instead of the zip\n"
@@ -324,9 +351,9 @@ def register_handlers(app: Client) -> None:
             "`/leech` (as a reply to an uploaded `.torrent` file) — same, from that file\n"
             "`/cancel` — cancel your in-progress job\n"
             "`/status` — show progress of your current job\n"
-            "`/usetting` — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap\n"
+            "`/usetting` (or `/us`) — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap\n"
             "`/stats` — your total files leeched and data downloaded (needs MongoDB)\n"
-            "`/sysinfo` — check if ffmpeg/ffprobe/aria2c/MongoDB are available on this deployment\n\n"
+            f"`/sysinfo` — check if ffmpeg/ffprobe/aria2c/MongoDB are available on this deployment\n{owner_line}\n"
             f"Max file size before splitting: {config.MAX_FILE_SIZE_MB} MB\n"
             f"{torrent_line}\n\n"
             "Pages that require login/JavaScript to reveal the real file URL "
@@ -395,9 +422,28 @@ def register_handlers(app: Client) -> None:
         job.cancelled = True
         await message.reply_text("🛑 Cancelling...")
 
+    @app.on_message(filters.command("a"))
+    async def authorize_cmd(client: Client, message: Message):
+        user_id = message.from_user.id if message.from_user else 0
+        if not _is_owner(user_id):
+            return  # silent -- don't reveal this command exists to non-owners
+        if message.chat.type == ChatType.PRIVATE:
+            await message.reply_text("Use `/a` inside a group to authorize/de-authorize it for /leech.")
+            return
+        now_authorized = auth_db.toggle(message.chat.id)
+        if now_authorized:
+            await message.reply_text("✅ This group is now authorized -- /leech works here.")
+        else:
+            await message.reply_text("🚫 This group is no longer authorized -- /leech is disabled here.")
+
     @app.on_message(filters.command(["leech", "l"]))
     async def leech_cmd(client: Client, message: Message):
         user_id = message.from_user.id
+
+        access_denied = _check_leech_access(message)
+        if access_denied:
+            await message.reply_text(access_denied)
+            return
 
         if not is_allowed(user_id):
             await message.reply_text("⛔ You're not allowed to use this bot.")
