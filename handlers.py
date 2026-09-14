@@ -305,6 +305,55 @@ def register_handlers(app: Client) -> None:
             f"First used: {first_seen_str}"
         )
 
+    @app.on_message(filters.command("mediainfo"))
+    async def mediainfo_cmd(client: Client, message: Message):
+        target = message.reply_to_message
+        if not target or not (target.video or target.audio or target.document):
+            await message.reply_text("Reply to a video, audio, or document with /mediainfo to get its technical details.")
+            return
+
+        if not metadata_mod.mediainfo_available():
+            await message.reply_text("⚠️ The `mediainfo` tool isn't installed on this deployment. Check /sysinfo.")
+            return
+
+        status = await message.reply_text("🔍 Downloading file to analyze...")
+        os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
+        tmp_path = os.path.join(config.DOWNLOAD_DIR, f"mediainfo_{message.from_user.id}_{int(time.time())}")
+
+        def dl_progress(current: int, total: int) -> None:
+            pass  # no live card needed for this -- it's a quick, one-shot analysis
+
+        try:
+            await client.download_media(target, file_name=tmp_path, progress=dl_progress)
+        except Exception as exc:  # noqa: BLE001
+            await _safe_edit(status, f"⚠️ Could not download the file: {exc}")
+            return
+
+        if not os.path.exists(tmp_path):
+            await _safe_edit(status, "⚠️ Download failed -- nothing to analyze.")
+            return
+
+        await _safe_edit(status, "🔎 Running MediaInfo...")
+        report = await metadata_mod.run_mediainfo(tmp_path)
+
+        if not report:
+            cleanup_paths([tmp_path])
+            await _safe_edit(status, "⚠️ MediaInfo couldn't analyze this file.")
+            return
+
+        if len(report) <= 3800:
+            cleanup_paths([tmp_path])
+            await _safe_edit(status, f"```\n{report}\n```")
+        else:
+            report_path = tmp_path + "_mediainfo.txt"
+            try:
+                with open(report_path, "w", encoding="utf-8") as f:
+                    f.write(report)
+                await client.send_document(status.chat.id, report_path, caption="📄 MediaInfo report (too long for a message)")
+                await status.delete()
+            finally:
+                cleanup_paths([tmp_path, report_path])
+
     @app.on_message(filters.command("sysinfo"))
     async def sysinfo_cmd(client: Client, message: Message):
         # Diagnostic command: helps figure out *why* something like the
@@ -321,6 +370,7 @@ def register_handlers(app: Client) -> None:
             "",
             f"ffmpeg: {check(metadata_mod.ffmpeg_available())}",
             f"ffprobe: {check(metadata_mod.ffprobe_available())}",
+            f"mediainfo: {check(metadata_mod.mediainfo_available())}",
             f"aria2c: {check(aria2_available())}",
             f"TORRENT_ENABLED: {'true' if config.TORRENT_ENABLED else 'false'}",
             f"MongoDB: {'✅ enabled (DB_URI set)' if mongo_db.mongo_enabled() else 'disabled (using local JSON file)'}",
@@ -352,6 +402,7 @@ def register_handlers(app: Client) -> None:
             "`/cancel` — cancel your in-progress job\n"
             "`/status` — show progress of your current job\n"
             "`/usetting` (or `/us`) — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap\n"
+            "`/mediainfo` (reply to a video/audio/document) — detailed technical report of that file\n"
             "`/stats` — your total files leeched and data downloaded (needs MongoDB)\n"
             f"`/sysinfo` — check if ffmpeg/ffprobe/aria2c/MongoDB are available on this deployment\n{owner_line}\n"
             f"Max file size before splitting: {config.MAX_FILE_SIZE_MB} MB\n"

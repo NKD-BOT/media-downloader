@@ -436,3 +436,31 @@ async def embed_custom_metadata(path: str, filename: str, settings: dict) -> Tup
     except OSError:
         pass
     return out_path, f"OK: applied {len(args) // 2} metadata field(s)."
+
+
+def mediainfo_available() -> bool:
+    return shutil.which("mediainfo") is not None
+
+
+async def run_mediainfo(path: str) -> Optional[str]:
+    """Runs the real `mediainfo` CLI tool (apt package `mediainfo`, not
+    ffprobe) on a file and returns its human-readable General/Video/
+    Audio/Text report -- the same format used by most MediaInfo Telegram
+    bots. Returns None if the tool isn't installed or analysis fails for
+    any reason."""
+    if not mediainfo_available():
+        return None
+
+    cmd = ["mediainfo", path]
+
+    def _run() -> bytes:
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=120)
+        return result.stdout
+
+    try:
+        raw = await asyncio.to_thread(_run)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("mediainfo failed for %s: %s", path, exc)
+        return None
+
+    return raw.decode(errors="ignore").strip() or None

@@ -393,7 +393,7 @@ def register_settings_handlers(app: Client) -> None:
             pass
         await _confirm_and_cleanup(client, message, "✅ Thumbnail saved.")
 
-    @app.on_message(filters.text & filters.private & ~filters.command(["cancel", "usetting", "us", "leech", "l", "ytdl", "status", "help", "start"]))
+    @app.on_message(filters.text & filters.private & ~filters.command(["cancel", "usetting", "us", "leech", "l", "ytdl", "status", "help", "start", "mediainfo", "sysinfo", "stats", "a"]))
     async def text_input_capture(client: Client, message: Message):
         pending = _pending.get(message.from_user.id)
         if not pending or pending["chat_id"] != message.chat.id:
