@@ -602,6 +602,21 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
         await _safe_edit(status_msg, "⚠️ Downloaded file is empty or missing.")
         return
 
+    # Belt-and-suspenders: download_file() already checks this internally,
+    # but some hosts stall/truncate in ways that slip past a single check
+    # point (e.g. no Content-Length at all, or a race with how the
+    # connection closes) -- verifying again here, right before anything
+    # else touches the file, means a partial file can never reach upload.
+    actual_size = os.path.getsize(dest_path)
+    if job.total > 0 and actual_size < job.total:
+        cleanup_paths([dest_path])
+        await _safe_edit(
+            status_msg,
+            f"⚠️ Incomplete download: got {human_size(actual_size)} of {human_size(job.total)} expected "
+            "-- the server cut the connection short. Try again, or use a different link."
+        )
+        return
+
     filename = custom_filename or filename_from_response(url, getattr(job, "content_disposition", None))
 
     # ---- Apply /usetting naming (name-swap + prefix/suffix) ----
