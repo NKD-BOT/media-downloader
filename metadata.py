@@ -340,7 +340,7 @@ def _parse_metadata_template(template: str, filename: str, extra: Dict[str, str]
     return pairs
 
 
-async def embed_custom_metadata(path: str, filename: str, settings: dict) -> str:
+async def embed_custom_metadata(path: str, filename: str, settings: dict) -> Tuple[str, Optional[str]]:
     """Remuxes `path` with the user's /usetting Metadata -> Global /
     Video / Audio / Subtitle templates applied, all in a single
     stream-copy pass (fast, lossless):
@@ -356,9 +356,14 @@ async def embed_custom_metadata(path: str, filename: str, settings: dict) -> str
 
     Falls back to the legacy single metadata_title setting (as a plain
     global title) if none of the four new fields are set, for anyone
-    upgrading from before this existed. Returns a new path on success, or
-    the original `path` unchanged if there's nothing to apply, ffmpeg is
-    unavailable, or the remux fails -- this never blocks a leech job."""
+    upgrading from before this existed.
+
+    Returns (path_to_upload, error_message). On success, path_to_upload
+    is the new remuxed file and error_message is None. On any failure --
+    nothing to apply, ffmpeg unavailable, or the remux itself failing --
+    path_to_upload is the original `path` unchanged (this never blocks a
+    leech job) and error_message describes what went wrong, or is None if
+    there was simply nothing configured to apply."""
     global_tpl = settings.get("metadata_global") or ""
     video_tpl = settings.get("metadata_video") or ""
     audio_tpl = settings.get("metadata_audio") or ""
@@ -368,17 +373,18 @@ async def embed_custom_metadata(path: str, filename: str, settings: dict) -> str
         global_tpl = f"title={settings['metadata_title']}"
 
     if not any([global_tpl, video_tpl, audio_tpl, subtitle_tpl]):
-        return path
+        return path, None
     if not ffmpeg_available():
         logger.info("ffmpeg not found on PATH -- skipping metadata for %s", path)
-        return path
+        return path, "ffmpeg isn't installed on this deployment."
 
     args: List[str] = []
     for key, value in _parse_metadata_template(global_tpl, filename, {}):
         args += ["-metadata", f"{key}={value}"]
 
     if video_tpl or audio_tpl or subtitle_tpl:
-        for s in await probe_stream_info(path):
+        streams = await probe_stream_info(path)
+        for s in streams:
             if s["codec_type"] == "video" and video_tpl:
                 for key, value in _parse_metadata_template(video_tpl, filename, {}):
                     args += [f"-metadata:s:v:{s['rel_index']}", f"{key}={value}"]
@@ -390,31 +396,36 @@ async def embed_custom_metadata(path: str, filename: str, settings: dict) -> str
                 extra = {"sublang": s["language"], "sublang_name": _readable_lang(s["language"])}
                 for key, value in _parse_metadata_template(subtitle_tpl, filename, extra):
                     args += [f"-metadata:s:s:{s['rel_index']}", f"{key}={value}"]
+        if not streams:
+            logger.warning("probe_stream_info returned no streams for %s -- video/audio/subtitle metadata (if any) won't apply, only Global.", path)
 
     if not args:
-        return path
+        return path, None
 
     out_path = path + ".meta" + os.path.splitext(path)[1]
     cmd = ["ffmpeg", "-y", "-i", path, "-map", "0", "-c", "copy", *args, out_path]
+    logger.info("Metadata embed command: %s", " ".join(cmd))
 
     def _run() -> None:
-        result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=900)
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=900)
         if result.returncode != 0 or not os.path.exists(out_path):
-            raise RuntimeError(result.stderr.decode(errors="ignore")[-500:])
+            stderr_tail = result.stderr.decode(errors="ignore")[-800:]
+            raise RuntimeError(f"ffmpeg exit code {result.returncode}: {stderr_tail}")
 
     try:
         await asyncio.to_thread(_run)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("Custom metadata embed failed for %s: %s", path, exc)
+        error_text = str(exc)
+        logger.warning("Custom metadata embed failed for %s: %s", path, error_text)
         try:
             if os.path.exists(out_path):
                 os.remove(out_path)
         except OSError:
             pass
-        return path
+        return path, f"FAILED: {error_text}"
 
     try:
         os.remove(path)
     except OSError:
         pass
-    return out_path
+    return out_path, f"OK: applied {len(args) // 2} metadata field(s)."

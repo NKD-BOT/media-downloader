@@ -640,7 +640,10 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
     if has_metadata and metadata_mod.is_media_file(filename):
         job.phase = "splitting"  # reuse an existing, harmless status label
         await _safe_edit(status_msg, "🏷 Embedding metadata...")
-        dest_path = await metadata_mod.embed_custom_metadata(dest_path, filename, settings)
+        dest_path, meta_debug = await metadata_mod.embed_custom_metadata(dest_path, filename, settings)
+        if meta_debug:
+            icon = "✅" if meta_debug.startswith("OK") else "⚠️"
+            await client.send_message(status_msg.chat.id, f"{icon} Metadata: ```\n{meta_debug}\n```")
 
     final_size = os.path.getsize(dest_path)
     await _safe_edit(status_msg, f"✅ Downloaded {human_size(final_size)}. Preparing upload...")
@@ -870,7 +873,10 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
             settings.get(k) for k in ("metadata_title", "metadata_global", "metadata_video", "metadata_audio", "metadata_subtitle")
         )
         if has_metadata and metadata_mod.is_media_file(name):
-            file_path = await metadata_mod.embed_custom_metadata(file_path, name, settings)
+            file_path, meta_debug = await metadata_mod.embed_custom_metadata(file_path, name, settings)
+            if meta_debug:
+                icon = "✅" if meta_debug.startswith("OK") else "⚠️"
+                await client.send_message(status_msg.chat.id, f"{icon} Metadata for {name}: ```\n{meta_debug}\n```")
 
         size = os.path.getsize(file_path)
 
