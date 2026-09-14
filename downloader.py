@@ -131,6 +131,19 @@ async def download_file(job: Job, url: str, dest_path: str, on_progress: Progres
                         job.downloaded = downloaded
                         on_progress(downloaded, total)
 
+                # Some CDNs / anti-bot fronts silently cut the connection
+                # after serving only the first few MB, without aiohttp ever
+                # raising an error -- the stream just ends early. Without
+                # this check that produces a truncated file that still gets
+                # uploaded as if it succeeded (broken video, wrong
+                # duration/size). Treat a short read as a hard failure.
+                if total > 0 and downloaded < total:
+                    raise DownloadError(
+                        f"Incomplete download: got {downloaded} of {total} bytes -- "
+                        "the server cut the connection short (common with anti-bot/"
+                        "rate-limiting CDNs). Try again in a bit, or use a different link."
+                    )
+
                 job.content_disposition = content_disposition  # type: ignore[attr-defined]
 
     except asyncio.TimeoutError as exc:

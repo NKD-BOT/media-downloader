@@ -3,12 +3,16 @@ uploader.py
 Uploads a finished file to Telegram, choosing a native media type
 (video/audio/photo) unless the user opted for plain documents via
 /usetting, and attaching a custom thumbnail when one is configured.
+Targets an explicit chat_id (rather than always replying in whatever
+chat the /leech command came from) so a leech started in a group can be
+delivered to the user's PM instead.
 """
 
 import logging
 import os
 from typing import Callable, Optional
 
+from pyrogram import Client
 from pyrogram.types import Message
 
 logger = logging.getLogger("leech.uploader")
@@ -19,7 +23,8 @@ _PHOTO_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 async def upload_file(
-    message: Message,
+    client: Client,
+    chat_id: int,
     path: str,
     file_name: str,
     caption: str,
@@ -30,10 +35,10 @@ async def upload_file(
     width: int = 0,
     height: int = 0,
 ) -> Message:
-    """Sends `path` as a reply in `message`'s chat. Falls back to a plain
-    document if a native-media send is attempted but rejected by Telegram
-    (e.g. a mislabeled/corrupt video), so a leech never fails outright
-    just because of the media-type guess.
+    """Sends `path` to `chat_id`. Falls back to a plain document if a
+    native-media send is attempted but rejected by Telegram (e.g. a
+    mislabeled/corrupt video), so a leech never fails outright just
+    because of the media-type guess.
 
     duration/width/height (when known, e.g. via metadata.probe_video_info)
     are passed straight to Telegram -- without them, clients often show a
@@ -47,19 +52,19 @@ async def upload_file(
             return None
         try:
             if ext in _VIDEO_EXTS:
-                return await message.reply_video(
-                    path, file_name=file_name, thumb=thumb_arg,
+                return await client.send_video(
+                    chat_id, path, file_name=file_name, thumb=thumb_arg,
                     duration=duration, width=width, height=height,
                     caption=caption, progress=progress,
                 )
             if ext in _AUDIO_EXTS:
-                return await message.reply_audio(
-                    path, file_name=file_name, thumb=thumb_arg,
+                return await client.send_audio(
+                    chat_id, path, file_name=file_name, thumb=thumb_arg,
                     duration=duration,
                     caption=caption, progress=progress,
                 )
             if ext in _PHOTO_EXTS:
-                return await message.reply_photo(path, caption=caption, progress=progress)
+                return await client.send_photo(chat_id, path, caption=caption, progress=progress)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Native upload failed for %s (%s); falling back to document.", file_name, exc)
         return None
@@ -68,7 +73,7 @@ async def upload_file(
     if sent is not None:
         return sent
 
-    return await message.reply_document(
-        path, file_name=file_name, thumb=thumb_arg,
+    return await client.send_document(
+        chat_id, path, file_name=file_name, thumb=thumb_arg,
         caption=caption, progress=progress,
     )

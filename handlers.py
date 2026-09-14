@@ -26,6 +26,7 @@ import zipfile
 from typing import Dict, List, Optional, Tuple, Union
 
 from pyrogram import Client, filters
+from pyrogram.enums import ChatType
 from pyrogram.types import (
     CallbackQuery,
     Document,
@@ -121,6 +122,32 @@ async def _prepare_video_extras(path: str, name: str, settings: dict) -> Tuple[d
 
 def _stop_keyboard(job: "AnyJob") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop", callback_data=f"cancel:{job.user_id}:{job.token}")]])
+
+
+async def _resolve_file_target(client: Client, message: Message) -> Optional[int]:
+    """Returns the chat_id the leeched file(s) should be uploaded to.
+    Commands, status cards, and everything else always stay in whatever
+    chat the /leech was sent from -- only the final file delivery is
+    redirected to the user's own PM when /leech was used in a
+    group/supergroup, to keep the group from being flooded with big
+    files. Checked upfront (before the download even starts) so a
+    failure here surfaces immediately; returns None (after already
+    replying with instructions in the group) if the bot can't message
+    that user privately yet."""
+    if message.chat.type == ChatType.PRIVATE:
+        return message.chat.id
+
+    try:
+        await client.send_message(message.from_user.id, "📎 The file(s) from this leech will be sent here.")
+    except Exception:  # noqa: BLE001
+        me = await client.get_me()
+        await message.reply_text(
+            "⚠️ I can't message you privately yet -- please start a chat with me first, then try again.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("💬 Start in PM", url=f"https://t.me/{me.username}")]]),
+        )
+        return None
+
+    return message.from_user.id
 
 
 def _user_mention(message: Message) -> str:
@@ -399,6 +426,10 @@ def register_handlers(app: Client) -> None:
                 await message.reply_text(f"⚠️ {torrent_disabled_reason()}")
                 return
 
+            target_chat_id = await _resolve_file_target(client, message)
+            if target_chat_id is None:
+                return
+
             job = TorrentJob(user_id=user_id, source=torrent_doc.file_name)
             _active_jobs[user_id] = job
             status_msg = await message.reply_text("🔍 Fetching .torrent file...")
@@ -409,7 +440,7 @@ def register_handlers(app: Client) -> None:
             )
             try:
                 await client.download_media(torrent_doc.file_id, file_name=tmp_torrent_path)
-                await run_torrent_job(client, message, status_msg, job, tmp_torrent_path,
+                await run_torrent_job(client, message, status_msg, job, tmp_torrent_path, target_chat_id,
                                        torrent_file_path=tmp_torrent_path, extract_zip=extract_zip)
             finally:
                 cleanup_paths([tmp_torrent_path])
@@ -440,11 +471,15 @@ def register_handlers(app: Client) -> None:
                     await message.reply_text(f"⚠️ {reason}")
                     return
 
+            target_chat_id = await _resolve_file_target(client, message)
+            if target_chat_id is None:
+                return
+
             job = TorrentJob(user_id=user_id, source=arg)
             _active_jobs[user_id] = job
             status_msg = await message.reply_text("🔍 Connecting...")
             try:
-                await run_torrent_job(client, message, status_msg, job, arg, extract_zip=extract_zip)
+                await run_torrent_job(client, message, status_msg, job, arg, target_chat_id, extract_zip=extract_zip)
             finally:
                 _active_jobs.pop(user_id, None)
             return
@@ -455,13 +490,17 @@ def register_handlers(app: Client) -> None:
             await message.reply_text(f"⚠️ {reason}")
             return
 
+        target_chat_id = await _resolve_file_target(client, message)
+        if target_chat_id is None:
+            return
+
         job = Job(user_id=user_id, url=arg)
         _active_jobs[user_id] = job
 
         status_msg = await message.reply_text("🔍 Connecting...")
 
         try:
-            await run_leech_job(client, message, status_msg, job, arg, custom_filename, extract_zip=extract_zip)
+            await run_leech_job(client, message, status_msg, job, arg, custom_filename, target_chat_id, extract_zip=extract_zip)
         finally:
             _active_jobs.pop(user_id, None)
 
@@ -476,7 +515,7 @@ def _find_torrent_document(message: Message) -> Optional[Document]:
 
 
 async def run_leech_job(client: Client, message: Message, status_msg: Message, job: Job,
-                         url: str, custom_filename: str, extract_zip: bool = False) -> None:
+                         url: str, custom_filename: str, target_chat_id: int, extract_zip: bool = False) -> None:
     os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
     tmp_name = f"leech_{job.user_id}_{int(time.time())}.tmp"
     dest_path = os.path.join(config.DOWNLOAD_DIR, tmp_name)
@@ -627,7 +666,7 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
         extras, thumb_path, generated_thumb = await _prepare_video_extras(path, name, settings)
         try:
             sent = await upload_file(
-                message, path, name,
+                client, target_chat_id, path, name,
                 caption=caption,
                 thumb=thumb_path,
                 send_as_document=settings.get("send_as_document", False),
@@ -652,15 +691,17 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
     job.phase = "done"
     total_time = time.time() - download_start
     await mongo_db.record_leech(job.user_id, _username(message), final_size)
+    pm_note = " -- sent to your PM 📩" if target_chat_id != message.chat.id else ""
     await _safe_edit(
         status_msg,
         f"✅ Done! {human_size(final_size)} in {int(total_time)}s"
         + (f" ({job.upload_count} parts)" if job.upload_count > 1 else "")
+        + pm_note
     )
 
 
 async def run_torrent_job(client: Client, message: Message, status_msg: Message, job: TorrentJob,
-                           source: str, torrent_file_path: str = None, extract_zip: bool = False) -> None:
+                           source: str, target_chat_id: int, torrent_file_path: str = None, extract_zip: bool = False) -> None:
     """Handles a magnet link / .torrent URL / .torrent file end to end:
     add to aria2 -> wait for metadata (magnet only) -> poll progress ->
     upload every file the torrent contained, splitting oversized ones
@@ -823,7 +864,7 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
         extras, thumb_path, generated_thumb = await _prepare_video_extras(path, name, settings)
         try:
             sent = await upload_file(
-                message, path, name,
+                client, target_chat_id, path, name,
                 caption=caption,
                 thumb=thumb_path,
                 send_as_document=settings.get("send_as_document", False),
@@ -843,4 +884,5 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
 
     job.phase = "done"
     await mongo_db.record_leech(job.user_id, _username(message), torrent_total_bytes)
-    await _safe_edit(status_msg, f"✅ Done! Uploaded {job.upload_count} file(s) from the torrent.")
+    pm_note = " -- sent to your PM 📩" if target_chat_id != message.chat.id else ""
+    await _safe_edit(status_msg, f"✅ Done! Uploaded {job.upload_count} file(s) from the torrent.{pm_note}")
