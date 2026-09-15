@@ -117,3 +117,38 @@ async def get_stats(user_id: int) -> Optional[Dict[str, Any]]:
     except Exception as exc:  # noqa: BLE001
         logger.warning("MongoDB stats read failed for user %s: %s", user_id, exc)
         return None
+
+
+async def is_chat_authorized(chat_id: int) -> Optional[bool]:
+    """Returns whether chat_id is an owner-authorized group for /leech,
+    or None (not True/False) if MongoDB isn't available -- callers should
+    fall back to their local JSON store in that case, not treat None as
+    "not authorized"."""
+    db = _get_db()
+    if db is None:
+        return None
+    try:
+        doc = await db.authorized_chats.find_one({"_id": chat_id})
+        return doc is not None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MongoDB authorized-chat read failed for %s: %s", chat_id, exc)
+        return None
+
+
+async def toggle_chat_authorization(chat_id: int) -> Optional[bool]:
+    """Flips chat_id's authorization on/off in MongoDB. Returns the new
+    state, or None if MongoDB isn't available (caller should fall back to
+    the local JSON store)."""
+    db = _get_db()
+    if db is None:
+        return None
+    try:
+        existing = await db.authorized_chats.find_one({"_id": chat_id})
+        if existing:
+            await db.authorized_chats.delete_one({"_id": chat_id})
+            return False
+        await db.authorized_chats.insert_one({"_id": chat_id})
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MongoDB authorized-chat toggle failed for %s: %s", chat_id, exc)
+        return None

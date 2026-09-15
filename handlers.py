@@ -41,6 +41,7 @@ import settings_db
 import mongo_db
 import auth_db
 import metadata as metadata_mod
+import telegraph
 from uploader import upload_file
 from leech_settings import pop_pending
 from downloader import Job, download_file, split_file, cleanup_paths, is_safe_url, DownloadError, Cancelled
@@ -71,7 +72,7 @@ def _is_owner(user_id: int) -> bool:
     return bool(config.OWNER_ID) and user_id == config.OWNER_ID
 
 
-def _check_leech_access(message: Message) -> Optional[str]:
+async def _check_leech_access(message: Message) -> Optional[str]:
     """Gatekeeper specifically for /leech (not /help, /status, etc.):
     - In the bot's PM, only the owner can leech.
     - In a group/supergroup, nobody can leech until the owner has
@@ -87,7 +88,7 @@ def _check_leech_access(message: Message) -> Optional[str]:
 
     if _is_owner(user_id):
         return None
-    if not auth_db.is_authorized(message.chat.id):
+    if not await auth_db.is_authorized(message.chat.id):
         return "⛔ This group isn't authorized yet. Ask the bot owner to run /a here."
     return None
 
@@ -335,14 +336,26 @@ def register_handlers(app: Client) -> None:
 
         await _safe_edit(status, "🔎 Running MediaInfo...")
         report = await metadata_mod.run_mediainfo(tmp_path)
+        cleanup_paths([tmp_path])
 
         if not report:
-            cleanup_paths([tmp_path])
             await _safe_edit(status, "⚠️ MediaInfo couldn't analyze this file.")
             return
 
-        if len(report) <= 3800:
-            cleanup_paths([tmp_path])
+        display_name = (
+            (target.video and target.video.file_name)
+            or (target.audio and target.audio.file_name)
+            or (target.document and target.document.file_name)
+            or "MediaInfo"
+        )
+
+        await _safe_edit(status, "📤 Publishing report...")
+        page_url = await telegraph.create_page(display_name, report)
+
+        if page_url:
+            await _safe_edit(status, f"📄 *MediaInfo*\n\n🔗 [{display_name}]({page_url})")
+        elif len(report) <= 3800:
+            # Telegraph unreachable -- fall back to a plain message
             await _safe_edit(status, f"```\n{report}\n```")
         else:
             report_path = tmp_path + "_mediainfo.txt"
@@ -352,7 +365,7 @@ def register_handlers(app: Client) -> None:
                 await client.send_document(status.chat.id, report_path, caption="📄 MediaInfo report (too long for a message)")
                 await status.delete()
             finally:
-                cleanup_paths([tmp_path, report_path])
+                cleanup_paths([report_path])
 
     @app.on_message(filters.command("sysinfo"))
     async def sysinfo_cmd(client: Client, message: Message):
@@ -481,7 +494,7 @@ def register_handlers(app: Client) -> None:
         if message.chat.type == ChatType.PRIVATE:
             await message.reply_text("Use `/a` inside a group to authorize/de-authorize it for /leech.")
             return
-        now_authorized = auth_db.toggle(message.chat.id)
+        now_authorized = await auth_db.toggle(message.chat.id)
         if now_authorized:
             await message.reply_text("✅ This group is now authorized -- /leech works here.")
         else:
@@ -491,7 +504,7 @@ def register_handlers(app: Client) -> None:
     async def leech_cmd(client: Client, message: Message):
         user_id = message.from_user.id
 
-        access_denied = _check_leech_access(message)
+        access_denied = await _check_leech_access(message)
         if access_denied:
             await message.reply_text(access_denied)
             return
@@ -692,9 +705,8 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
         job.phase = "splitting"  # reuse an existing, harmless status label
         await _safe_edit(status_msg, "🏷 Embedding metadata...")
         dest_path, meta_debug = await metadata_mod.embed_custom_metadata(dest_path, filename, settings)
-        if meta_debug:
-            icon = "✅" if meta_debug.startswith("OK") else "⚠️"
-            await client.send_message(status_msg.chat.id, f"{icon} Metadata: ```\n{meta_debug}\n```")
+        if meta_debug and meta_debug.startswith("FAILED"):
+            await client.send_message(status_msg.chat.id, f"⚠️ Metadata: ```\n{meta_debug}\n```")
 
     final_size = os.path.getsize(dest_path)
     await _safe_edit(status_msg, f"✅ Downloaded {human_size(final_size)}. Preparing upload...")
@@ -925,9 +937,8 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
         )
         if has_metadata and metadata_mod.is_media_file(name):
             file_path, meta_debug = await metadata_mod.embed_custom_metadata(file_path, name, settings)
-            if meta_debug:
-                icon = "✅" if meta_debug.startswith("OK") else "⚠️"
-                await client.send_message(status_msg.chat.id, f"{icon} Metadata for {name}: ```\n{meta_debug}\n```")
+            if meta_debug and meta_debug.startswith("FAILED"):
+                await client.send_message(status_msg.chat.id, f"⚠️ Metadata for {name}: ```\n{meta_debug}\n```")
 
         size = os.path.getsize(file_path)
 

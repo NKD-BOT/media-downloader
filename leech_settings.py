@@ -91,6 +91,24 @@ def pop_pending(user_id: int) -> bool:
     return _pending.pop(user_id, None) is not None
 
 
+async def _render(client: Client, chat_id: int, message_id: int, text: str,
+                   keyboard: InlineKeyboardMarkup, thumb_path: Optional[str] = None) -> Message:
+    """(Re)draws a settings screen at chat_id/message_id. If a custom
+    thumbnail is currently set, shows it as the message's photo with
+    `text` as the caption; otherwise a plain text message. Telegram can't
+    turn a text message into a photo message (or back) via edit, so this
+    always deletes the old message and sends a fresh one -- simpler and
+    more robust than tracking which type is currently displayed."""
+    try:
+        await client.delete_messages(chat_id, message_id)
+    except Exception:  # noqa: BLE001
+        pass
+
+    if thumb_path and os.path.exists(thumb_path):
+        return await client.send_photo(chat_id, thumb_path, caption=text, reply_markup=keyboard)
+    return await client.send_message(chat_id, text, reply_markup=keyboard)
+
+
 async def _delete_quietly(message: Message) -> None:
     try:
         await message.delete()
@@ -203,39 +221,33 @@ def _swap_menu_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
     ])
 
 
-async def _render_main(message: Message, settings: Dict[str, Any]) -> None:
-    await message.edit_text(
-        _main_menu_text(settings),
-        reply_markup=_main_menu_keyboard(settings),
-    )
+async def _render_main(client: Client, chat_id: int, message_id: int, settings: Dict[str, Any]) -> Message:
+    return await _render(client, chat_id, message_id, _main_menu_text(settings),
+                          _main_menu_keyboard(settings), thumb_path=settings.get("thumbnail_path"))
 
 
-async def _render_swap(message: Message, settings: Dict[str, Any]) -> None:
-    await message.edit_text(
-        _swap_menu_text(settings),
-        reply_markup=_swap_menu_keyboard(settings),
-    )
+async def _render_swap(client: Client, chat_id: int, message_id: int, settings: Dict[str, Any]) -> Message:
+    return await _render(client, chat_id, message_id, _swap_menu_text(settings),
+                          _swap_menu_keyboard(settings), thumb_path=settings.get("thumbnail_path"))
 
 
-async def _render_metadata(message: Message, settings: Dict[str, Any]) -> None:
-    await message.edit_text(
-        _metadata_menu_text(settings),
-        reply_markup=_metadata_menu_keyboard(settings),
-    )
+async def _render_metadata(client: Client, chat_id: int, message_id: int, settings: Dict[str, Any]) -> Message:
+    return await _render(client, chat_id, message_id, _metadata_menu_text(settings),
+                          _metadata_menu_keyboard(settings), thumb_path=settings.get("thumbnail_path"))
 
 
 def _prompt_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="lset:back")]])
 
 
-async def _ask_for(query: CallbackQuery, key: str, menu: str = "main") -> None:
+async def _ask_for(client: Client, query: CallbackQuery, key: str, menu: str = "main") -> None:
+    new_msg = await _render(client, query.message.chat.id, query.message.id, _PROMPTS[key], _prompt_keyboard())
     _pending[query.from_user.id] = {
         "key": key,
-        "chat_id": query.message.chat.id,
-        "message_id": query.message.id,
+        "chat_id": new_msg.chat.id,
+        "message_id": new_msg.id,
         "menu": menu,  # which menu to redraw once this field is saved
     }
-    await query.message.edit_text(_PROMPTS[key], reply_markup=_prompt_keyboard())
 
 
 def register_settings_handlers(app: Client) -> None:
@@ -243,20 +255,26 @@ def register_settings_handlers(app: Client) -> None:
     @app.on_message(filters.command(["usetting", "us"]))
     async def leechset_cmd(client: Client, message: Message):
         settings = await settings_db.get_settings(message.from_user.id)
-        await message.reply_text(
-            _main_menu_text(settings),
-            reply_markup=_main_menu_keyboard(settings),
-        )
+        thumb = settings.get("thumbnail_path")
+        if thumb and os.path.exists(thumb):
+            await message.reply_photo(thumb, caption=_main_menu_text(settings), reply_markup=_main_menu_keyboard(settings))
+        else:
+            await message.reply_text(_main_menu_text(settings), reply_markup=_main_menu_keyboard(settings))
 
     @app.on_callback_query(filters.regex(r"^lset:"))
     async def leechset_callback(client: Client, query: CallbackQuery):
         user_id = query.from_user.id
         action = query.data.split(":", 1)[1]
         settings = await settings_db.get_settings(user_id)
+        chat_id, message_id = query.message.chat.id, query.message.id
 
         if action == "close":
             _pending.pop(user_id, None)
-            await query.message.edit_text("Settings closed.")
+            try:
+                await client.delete_messages(chat_id, message_id)
+            except Exception:  # noqa: BLE001
+                pass
+            await client.send_message(chat_id, "Settings closed.")
             await query.answer()
             return
 
@@ -265,67 +283,67 @@ def register_settings_handlers(app: Client) -> None:
             settings = await settings_db.get_settings(user_id)
             return_menu = pending.get("menu") if pending else None
             if return_menu == "metadata":
-                await _render_metadata(query.message, settings)
+                await _render_metadata(client, chat_id, message_id, settings)
             elif return_menu == "swap":
-                await _render_swap(query.message, settings)
+                await _render_swap(client, chat_id, message_id, settings)
             else:
-                await _render_main(query.message, settings)
+                await _render_main(client, chat_id, message_id, settings)
             await query.answer()
             return
 
         if action == "toggle_doc":
             settings = await settings_db.update_settings(user_id, send_as_document=not settings["send_as_document"])
-            await _render_main(query.message, settings)
+            await _render_main(client, chat_id, message_id, settings)
             await query.answer()
             return
 
         if action == "thumb":
-            await _ask_for(query, "thumbnail")
+            await _ask_for(client, query, "thumbnail")
             await query.answer()
             return
 
         if action == "prefix":
-            await _ask_for(query, "leech_prefix")
+            await _ask_for(client, query, "leech_prefix")
             await query.answer()
             return
 
         if action == "suffix":
-            await _ask_for(query, "leech_suffix")
+            await _ask_for(client, query, "leech_suffix")
             await query.answer()
             return
 
         if action == "caption":
-            await _ask_for(query, "leech_caption")
+            await _ask_for(client, query, "leech_caption")
             await query.answer()
             return
 
         if action == "metadata":
-            await _ask_for(query, "metadata_title")
+            await _ask_for(client, query, "metadata_title")
             await query.answer()
             return
 
         if action == "meta_menu":
-            await _render_metadata(query.message, settings)
+            await _render_metadata(client, chat_id, message_id, settings)
             await query.answer()
             return
 
         if action == "meta_global":
-            await _ask_for(query, "metadata_global", menu="metadata")
+            await _ask_for(client, query, "metadata_global", menu="metadata")
             await query.answer()
             return
 
         if action == "meta_video":
-            await _ask_for(query, "metadata_video", menu="metadata")
+            await _ask_for(client, query, "metadata_video", menu="metadata")
             await query.answer()
             return
 
         if action == "meta_audio":
-            await _ask_for(query, "metadata_audio", menu="metadata")
+            await _ask_for(client, query, "metadata_audio", menu="metadata")
             await query.answer()
             return
 
         if action == "meta_subtitle":
-            await _ask_for(query, "metadata_subtitle", menu="metadata")
+            await _ask_for(client, query, "metadata_subtitle", menu="metadata")
             await query.answer()
             return
 
@@ -334,34 +352,34 @@ def register_settings_handlers(app: Client) -> None:
                 user_id, metadata_title=None, metadata_global="", metadata_video="",
                 metadata_audio="", metadata_subtitle="",
             )
-            await _render_metadata(query.message, settings)
+            await _render_metadata(client, chat_id, message_id, settings)
             await query.answer("Cleared all metadata.")
             return
 
         if action == "dump":
-            await _ask_for(query, "dump_chat_id")
+            await _ask_for(client, query, "dump_chat_id")
             await query.answer()
             return
 
         if action == "swap_menu":
-            await _render_swap(query.message, settings)
+            await _render_swap(client, chat_id, message_id, settings)
             await query.answer()
             return
 
         if action == "swap_toggle":
             settings = await settings_db.update_settings(user_id, name_swap_enabled=not settings["name_swap_enabled"])
-            await _render_swap(query.message, settings)
+            await _render_swap(client, chat_id, message_id, settings)
             await query.answer()
             return
 
         if action == "swap_add":
-            await _ask_for(query, "name_swap_pair", menu="swap")
+            await _ask_for(client, query, "name_swap_pair", menu="swap")
             await query.answer()
             return
 
         if action == "swap_clear":
             settings = await settings_db.clear_name_swap_pairs(user_id)
-            await _render_swap(query.message, settings)
+            await _render_swap(client, chat_id, message_id, settings)
             await query.answer("Cleared all pairs.")
             return
 
@@ -385,10 +403,7 @@ def register_settings_handlers(app: Client) -> None:
         _pending.pop(message.from_user.id, None)
         settings = await settings_db.update_settings(message.from_user.id, thumbnail_path=dest)
         try:
-            await client.edit_message_text(
-                pending["chat_id"], pending["message_id"],
-                _main_menu_text(settings), reply_markup=_main_menu_keyboard(settings),
-            )
+            await _render_main(client, pending["chat_id"], pending["message_id"], settings)
         except Exception:  # noqa: BLE001
             pass
         await _confirm_and_cleanup(client, message, "✅ Thumbnail saved.")
@@ -447,10 +462,7 @@ def register_settings_handlers(app: Client) -> None:
                 settings = await settings_db.update_settings(message.from_user.id, name_swap_enabled=True)
             _pending.pop(message.from_user.id, None)
             try:
-                await client.edit_message_text(
-                    pending["chat_id"], pending["message_id"],
-                    _swap_menu_text(settings), reply_markup=_swap_menu_keyboard(settings),
-                )
+                await _render_swap(client, pending["chat_id"], pending["message_id"], settings)
             except Exception:  # noqa: BLE001
                 pass
             confirm_text = f"✅ Added {len(valid)} pair(s), name swap turned on."
@@ -482,13 +494,11 @@ def register_settings_handlers(app: Client) -> None:
 
 async def _finish(client: Client, message: Message, pending: Dict[str, Any], settings: Dict[str, Any]) -> None:
     menu = pending.get("menu", "main")
-    text, markup = (
-        (_metadata_menu_text(settings), _metadata_menu_keyboard(settings))
-        if menu == "metadata"
-        else (_main_menu_text(settings), _main_menu_keyboard(settings))
-    )
     try:
-        await client.edit_message_text(pending["chat_id"], pending["message_id"], text, reply_markup=markup)
+        if menu == "metadata":
+            await _render_metadata(client, pending["chat_id"], pending["message_id"], settings)
+        else:
+            await _render_main(client, pending["chat_id"], pending["message_id"], settings)
     except Exception:  # noqa: BLE001
         pass
     await _confirm_and_cleanup(client, message, "✅ Saved.")
