@@ -103,6 +103,128 @@ class Job:
     current_name: str = ""  # display filename shown on the live status card
 
 
+async def _probe_range_support(session: aiohttp.ClientSession, url: str) -> tuple:
+    """Sends a 1-byte Range request to check whether the server supports
+    partial content (needed for parallel/segmented downloading) and to
+    learn the total size and Content-Disposition up front. Returns
+    (total_size_or_0, supports_range, content_disposition_or_None)."""
+    try:
+        async with session.get(url, headers={"Range": "bytes=0-0"}, allow_redirects=True) as resp:
+            content_disposition = resp.headers.get("Content-Disposition")
+            if resp.status == 206:
+                content_range = resp.headers.get("Content-Range", "")
+                if "/" in content_range:
+                    try:
+                        total = int(content_range.rsplit("/", 1)[-1])
+                        return total, True, content_disposition
+                    except ValueError:
+                        pass
+            elif resp.status == 200:
+                total = int(resp.headers.get("Content-Length", 0))
+                return total, False, content_disposition
+    except Exception as exc:  # noqa: BLE001
+        logger.info("Range probe failed for %s (%s); falling back to a single connection.", url, exc)
+    return 0, False, None
+
+
+async def _download_segment(
+    session: aiohttp.ClientSession, url: str, dest_path: str,
+    start: int, end: int, job: Job,
+) -> None:
+    """Downloads byte range [start, end] (inclusive) into dest_path at the
+    matching offset. Multiple segments can run concurrently against the
+    same pre-allocated file since their byte ranges never overlap."""
+    headers = {"Range": f"bytes={start}-{end}"}
+    async with session.get(url, headers=headers, allow_redirects=True) as resp:
+        if resp.status not in (200, 206):
+            raise DownloadError(f"Segment request returned HTTP {resp.status}")
+        async with aiofiles.open(dest_path, "r+b") as f:
+            await f.seek(start)
+            async for chunk in resp.content.iter_chunked(config.DOWNLOAD_CHUNK_SIZE):
+                if job.cancelled:
+                    raise Cancelled()
+                await f.write(chunk)
+                job.downloaded += len(chunk)
+
+
+async def _download_parallel(
+    session: aiohttp.ClientSession, url: str, dest_path: str,
+    total: int, job: Job, on_progress: ProgressCallback,
+) -> None:
+    """Splits [0, total) into config.PARALLEL_CONNECTIONS roughly-equal
+    byte ranges and downloads them concurrently -- meaningfully faster
+    than a single stream on hosts that throttle per-connection speed
+    (very common on free file-hosting sites), since each connection gets
+    its own throttle allowance."""
+    connections = max(1, config.PARALLEL_CONNECTIONS)
+    # Pre-allocate the file to its final size so each segment can safely
+    # seek+write its own region without another segment's writes colliding.
+    async with aiofiles.open(dest_path, "wb") as f:
+        if total > 0:
+            await f.seek(total - 1)
+            await f.write(b"\0")
+
+    chunk_size = -(-total // connections)  # ceil division
+    ranges = []
+    pos = 0
+    while pos < total:
+        end = min(pos + chunk_size - 1, total - 1)
+        ranges.append((pos, end))
+        pos = end + 1
+
+    async def _progress_pump():
+        while not job.cancelled:
+            on_progress(job.downloaded, total)
+            await asyncio.sleep(1)
+
+    pump_task = asyncio.create_task(_progress_pump())
+    tasks = [
+        asyncio.create_task(_download_segment(session, url, dest_path, start, end, job))
+        for start, end in ranges
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except BaseException:
+        # If one segment fails/cancels, make sure the others actually stop
+        # too instead of continuing to download in the background.
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    finally:
+        pump_task.cancel()
+    on_progress(job.downloaded, total)
+
+
+async def _download_single(
+    session: aiohttp.ClientSession, url: str, dest_path: str, job: Job, on_progress: ProgressCallback,
+) -> tuple:
+    """The original single-connection streaming download -- used when the
+    server doesn't support Range requests, or the file is too small for
+    parallel downloading to be worth the overhead. Returns
+    (total_size, content_disposition)."""
+    async with session.get(url, allow_redirects=True) as resp:
+        if resp.status != 200:
+            raise DownloadError(f"Server returned HTTP {resp.status}")
+
+        total = int(resp.headers.get("Content-Length", 0))
+        job.total = total
+        content_disposition = resp.headers.get("Content-Disposition")
+
+        downloaded = 0
+        async with aiofiles.open(dest_path, "wb") as f:
+            async for chunk in resp.content.iter_chunked(config.DOWNLOAD_CHUNK_SIZE):
+                if job.cancelled:
+                    raise Cancelled()
+                await f.write(chunk)
+                downloaded += len(chunk)
+                job.downloaded = downloaded
+                on_progress(downloaded, total)
+
+        return total, content_disposition
+
+
 async def download_file(job: Job, url: str, dest_path: str, on_progress: ProgressCallback) -> None:
     os.makedirs(os.path.dirname(dest_path) or ".", exist_ok=True)
     timeout = aiohttp.ClientTimeout(
@@ -114,38 +236,36 @@ async def download_file(job: Job, url: str, dest_path: str, on_progress: Progres
 
     try:
         async with aiohttp.ClientSession(timeout=timeout, headers=DEFAULT_HEADERS) as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                if resp.status != 200:
-                    raise DownloadError(f"Server returned HTTP {resp.status}")
+            total, supports_range, content_disposition = await _probe_range_support(session, url)
 
-                total = int(resp.headers.get("Content-Length", 0))
+            use_parallel = (
+                supports_range
+                and config.PARALLEL_CONNECTIONS > 1
+                and total >= config.PARALLEL_MIN_SIZE_MB * 1024 * 1024
+            )
+
+            if use_parallel:
                 job.total = total
-                content_disposition = resp.headers.get("Content-Disposition")
+                await _download_parallel(session, url, dest_path, total, job, on_progress)
+                downloaded = job.downloaded
+            else:
+                total, content_disposition = await _download_single(session, url, dest_path, job, on_progress)
+                downloaded = job.downloaded
 
-                downloaded = 0
-                async with aiofiles.open(dest_path, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(config.DOWNLOAD_CHUNK_SIZE):
-                        if job.cancelled:
-                            raise Cancelled()
-                        await f.write(chunk)
-                        downloaded += len(chunk)
-                        job.downloaded = downloaded
-                        on_progress(downloaded, total)
+            # Some CDNs / anti-bot fronts silently cut the connection
+            # after serving only the first few MB, without aiohttp ever
+            # raising an error -- the stream just ends early. Without
+            # this check that produces a truncated file that still gets
+            # uploaded as if it succeeded (broken video, wrong
+            # duration/size). Treat a short read as a hard failure.
+            if total > 0 and downloaded < total:
+                raise DownloadError(
+                    f"Incomplete download: got {downloaded} of {total} bytes -- "
+                    "the server cut the connection short (common with anti-bot/"
+                    "rate-limiting CDNs). Try again in a bit, or use a different link."
+                )
 
-                # Some CDNs / anti-bot fronts silently cut the connection
-                # after serving only the first few MB, without aiohttp ever
-                # raising an error -- the stream just ends early. Without
-                # this check that produces a truncated file that still gets
-                # uploaded as if it succeeded (broken video, wrong
-                # duration/size). Treat a short read as a hard failure.
-                if total > 0 and downloaded < total:
-                    raise DownloadError(
-                        f"Incomplete download: got {downloaded} of {total} bytes -- "
-                        "the server cut the connection short (common with anti-bot/"
-                        "rate-limiting CDNs). Try again in a bit, or use a different link."
-                    )
-
-                job.content_disposition = content_disposition  # type: ignore[attr-defined]
+            job.content_disposition = content_disposition  # type: ignore[attr-defined]
 
     except asyncio.TimeoutError as exc:
         raise DownloadError(

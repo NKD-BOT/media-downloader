@@ -55,6 +55,13 @@ MAX_FILE_SIZE_MB: int = _get_int("MAX_FILE_SIZE_MB", 1990)
 # disable splitting and just refuse oversized files.
 SPLIT_SIZE_MB: int = _get_int("SPLIT_SIZE_MB", 1990)
 DOWNLOAD_CHUNK_SIZE: int = 1024 * 1024  # 1 MiB streaming chunks
+# Many file hosts throttle each individual HTTP connection (not the
+# account/IP as a whole), so several simultaneous connections against
+# different byte ranges of the same file can add up to noticeably higher
+# real-world speed. Only used when the server actually supports Range
+# requests (auto-detected) and the file is at least PARALLEL_MIN_SIZE_MB.
+PARALLEL_CONNECTIONS: int = _get_int("PARALLEL_CONNECTIONS", 4)
+PARALLEL_MIN_SIZE_MB: int = _get_int("PARALLEL_MIN_SIZE_MB", 20)
 REQUEST_TIMEOUT_SECONDS: int = _get_int("REQUEST_TIMEOUT_SECONDS", 3600)
 # Separate, much shorter timeouts for establishing the connection and for
 # any single stalled read -- without these, a server that silently hangs
