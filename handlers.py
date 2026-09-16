@@ -22,7 +22,6 @@ import json
 import os
 import re
 import shutil
-import sys
 import time
 import logging
 import zipfile
@@ -555,10 +554,16 @@ def register_handlers(app: Client) -> None:
         except OSError as exc:
             logger.warning("Could not save restart state: %s", exc)
 
-        # Replaces this process in place with a fresh one running the same
-        # script -- main.py's startup then finds the note above and edits
-        # this same message into a confirmation once it's back online.
-        os.execl(sys.executable, sys.executable, *sys.argv)
+        # Exit and let the host's own process supervisor (Railway, Docker's
+        # restart policy, etc.) relaunch the container. os.execl()'ing in
+        # place used to be tried here, but replacing the process image
+        # mid-coroutine races with asyncio/Pyrogram's own signal handling
+        # and in-flight tasks (observed as a "Task attached to a different
+        # loop" crash) -- a hard, immediate exit sidesteps all of that, at
+        # the cost of relying on the host to actually restart on exit
+        # (true for Railway and any standard Docker restart policy).
+        logger.info("Restart requested by owner -- exiting for the host to relaunch.")
+        os._exit(1)
 
     @app.on_message(filters.command(["leech", "l"]))
     async def leech_cmd(client: Client, message: Message):
