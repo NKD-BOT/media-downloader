@@ -73,6 +73,14 @@ _PROMPTS = {
         "Send `-` to clear it."
     ),
     "dump_chat_id": "Send the *dump chat ID* every leeched file should also be copied to (the bot must already be a member/admin there), or `-` to clear it.",
+    "excluded_extensions": (
+        "Send comma-separated file extensions to *skip* when leeching a torrent's files, "
+        "e.g. `.txt,.nfo,.jpg`. Send `-` to clear it (upload every file again)."
+    ),
+    "split_size_mb": (
+        "Send your own *split size in MB* (overrides the bot's default for you), e.g. `1500`. "
+        "Send `-` to go back to the bot's default."
+    ),
     "name_swap_pair": (
         "Send one or more patterns to strip/replace, as `find:::replace`. "
         "Add several at once by separating them with `|`.\n"
@@ -145,6 +153,9 @@ def _main_menu_text(settings: Dict[str, Any]) -> str:
     lines.append(f"Thumbnail: {'set ✅' if settings['thumbnail_path'] else 'not set'}")
     swap_state = "on" if settings["name_swap_enabled"] else "off"
     lines.append(f"Name swap: {swap_state} ({len(settings['name_swap_pairs'])} pair(s))")
+    lines.append(f"Excluded extensions: `{settings.get('excluded_extensions') or '—'}`")
+    split_mb = settings.get("split_size_mb") or 0
+    lines.append(f"Split size: {f'{split_mb} MB (custom)' if split_mb else 'bot default'}")
     return "\n".join(lines)
 
 
@@ -165,6 +176,10 @@ def _main_menu_keyboard(settings: Dict[str, Any]) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("📤 Dump", callback_data="lset:dump"),
             InlineKeyboardButton("🔀 Name Swap", callback_data="lset:swap_menu"),
+        ],
+        [
+            InlineKeyboardButton("🚫 Excluded Ext", callback_data="lset:excluded_ext"),
+            InlineKeyboardButton("✂️ Split Size", callback_data="lset:split_size"),
         ],
         [
             InlineKeyboardButton("❌ Close", callback_data="lset:close"),
@@ -361,6 +376,16 @@ def register_settings_handlers(app: Client) -> None:
             await query.answer()
             return
 
+        if action == "excluded_ext":
+            await _ask_for(client, query, "excluded_extensions")
+            await query.answer()
+            return
+
+        if action == "split_size":
+            await _ask_for(client, query, "split_size_mb")
+            await query.answer()
+            return
+
         if action == "swap_menu":
             await _render_swap(client, chat_id, message_id, settings)
             await query.answer()
@@ -484,8 +509,24 @@ def register_settings_handlers(app: Client) -> None:
             await _finish(client, message, pending, settings)
             return
 
+        if key == "split_size_mb":
+            if value == "-":
+                settings = await settings_db.update_settings(message.from_user.id, split_size_mb=0)
+            else:
+                try:
+                    mb = int(value)
+                    if mb <= 0:
+                        raise ValueError
+                except ValueError:
+                    await message.reply_text("Split size must be a positive whole number of MB, or `-` to reset it.")
+                    return
+                settings = await settings_db.update_settings(message.from_user.id, split_size_mb=mb)
+            _pending.pop(message.from_user.id, None)
+            await _finish(client, message, pending, settings)
+            return
+
         # Simple text fields: leech_prefix / leech_suffix / leech_caption /
-        # metadata_title / metadata_global / metadata_video / metadata_audio / metadata_subtitle
+        # metadata_title / metadata_global / metadata_video / metadata_audio / metadata_subtitle / excluded_extensions
         new_value = None if value == "-" else value
         settings = await settings_db.update_settings(message.from_user.id, **{key: new_value})
         _pending.pop(message.from_user.id, None)

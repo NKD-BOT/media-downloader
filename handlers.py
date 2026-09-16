@@ -19,6 +19,7 @@ running is rejected with a clear message rather than silently queued.
 
 import asyncio
 import os
+import re
 import shutil
 import time
 import logging
@@ -42,6 +43,7 @@ import mongo_db
 import auth_db
 import metadata as metadata_mod
 import telegraph
+import ytdlp
 from uploader import upload_file
 from leech_settings import pop_pending
 from downloader import Job, download_file, split_file, cleanup_paths, is_safe_url, DownloadError, Cancelled
@@ -147,6 +149,26 @@ async def _prepare_video_extras(path: str, name: str, settings: dict) -> Tuple[d
     return extras, thumb_path, generated_thumb
 
 
+async def _auto_mediainfo(client: Client, chat_id: int, path: str, name: str) -> None:
+    """Runs MediaInfo on a just-uploaded file and posts the Telegraph
+    link, matching how most leech bots auto-attach it after a completed
+    leech. Only for whole (unsplit) video/audio files -- a raw split part
+    isn't valid media and would just produce a nonsense report. Never
+    raises; any failure here is silent (the leech itself already
+    succeeded, this is just a nice-to-have extra)."""
+    if not metadata_mod.is_media_file(name):
+        return
+    try:
+        report = await metadata_mod.run_mediainfo(path)
+        if not report:
+            return
+        page_url = await telegraph.create_page(name, report)
+        if page_url:
+            await client.send_message(chat_id, f"📄 *MediaInfo*: [{name}]({page_url})")
+    except Exception:  # noqa: BLE001
+        logger.exception("Auto-MediaInfo failed for %s", name)
+
+
 def _stop_keyboard(job: "AnyJob") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop", callback_data=f"cancel:{job.user_id}:{job.token}")]])
 
@@ -218,6 +240,7 @@ async def _run_status_loop(status_msg: Message, job: "AnyJob", phases: set, engi
                 _status_label(job), job.downloaded, job.total, job.start_time,
                 engine=engine, mode=mode, user_mention=user_mention, user_id=job.user_id,
                 seeders=seeders, leechers=leechers,
+                download_dir=config.DOWNLOAD_DIR, filename=job.current_name, phase=job.phase,
             )
             await _safe_edit(status_msg, text, reply_markup=_stop_keyboard(job))
         except Exception:  # noqa: BLE001
@@ -384,6 +407,7 @@ def register_handlers(app: Client) -> None:
             f"ffmpeg: {check(metadata_mod.ffmpeg_available())}",
             f"ffprobe: {check(metadata_mod.ffprobe_available())}",
             f"mediainfo: {check(metadata_mod.mediainfo_available())}",
+            f"yt-dlp: {check(ytdlp.ytdlp_available())}",
             f"aria2c: {check(aria2_available())}",
             f"TORRENT_ENABLED: {'true' if config.TORRENT_ENABLED else 'false'}",
             f"MongoDB: {'✅ enabled (DB_URI set)' if mongo_db.mongo_enabled() else 'disabled (using local JSON file)'}",
@@ -410,12 +434,14 @@ def register_handlers(app: Client) -> None:
             "`/leech <url> [filename]` — download a direct link and upload it here (`/l` shortcut also works)\n"
             "`/leech <url> -e` — download a .zip and upload its extracted contents instead of the zip\n"
             "`/leech <magnet_link>` — download a torrent via magnet and upload its files\n"
+            "`/leech <YouTube/other link>` — download via yt-dlp (YouTube, Twitter/X, Instagram, TikTok, Reddit, and more)\n"
             "`/leech <.torrent url>` — same, fetched from a direct .torrent link\n"
             "`/leech` (as a reply to an uploaded `.torrent` file) — same, from that file\n"
             "`/cancel` — cancel your in-progress job\n"
             "`/status` — show progress of your current job\n"
             "`/usetting` (or `/us`) — customize prefix/suffix/caption/thumbnail/metadata/dump/name-swap\n"
             "`/mediainfo` (reply to a video/audio/document) — detailed technical report of that file\n"
+            "MediaInfo is also posted automatically after every leeched video/audio file\n"
             "`/stats` — your total files leeched and data downloaded (needs MongoDB)\n"
             f"`/sysinfo` — check if ffmpeg/ffprobe/aria2c/MongoDB are available on this deployment\n{owner_line}\n"
             f"Max file size before splitting: {config.MAX_FILE_SIZE_MB} MB\n"
@@ -447,6 +473,7 @@ def register_handlers(app: Client) -> None:
             _status_label(job), job.downloaded, job.total, job.start_time,
             engine=engine, mode="#Leech", user_mention=_user_mention(message), user_id=job.user_id,
             seeders=seeders, leechers=leechers,
+            download_dir=config.DOWNLOAD_DIR, filename=job.current_name, phase=job.phase,
         )
         await message.reply_text(text, reply_markup=_stop_keyboard(job))
 
@@ -594,6 +621,21 @@ def register_handlers(app: Client) -> None:
                 _active_jobs.pop(user_id, None)
             return
 
+        # ---- Case 2.5: YouTube or another yt-dlp-supported site ----
+        if ytdlp.is_ytdlp_source(arg):
+            target_chat_id = await _resolve_file_target(client, message)
+            if target_chat_id is None:
+                return
+
+            job = Job(user_id=user_id, url=arg)
+            _active_jobs[user_id] = job
+            status_msg = await message.reply_text("🔍 Connecting...")
+            try:
+                await run_ytdlp_job(client, message, status_msg, job, arg, custom_filename, target_chat_id, extract_zip=extract_zip)
+            finally:
+                _active_jobs.pop(user_id, None)
+            return
+
         # ---- Case 3: plain direct HTTP(S) link (existing behavior) ----
         reason = is_safe_url(arg)
         if reason:
@@ -624,6 +666,164 @@ def _find_torrent_document(message: Message) -> Optional[Document]:
     return None
 
 
+async def _process_downloaded_file(
+    client: Client, message: Message, status_msg: Message, job: "AnyJob",
+    target_chat_id: int, dest_path: str, filename: str, extract_zip: bool, download_start: float,
+) -> None:
+    """Shared post-download pipeline: naming, disguised-extension
+    correction, custom metadata, splitting, upload, dump-copy,
+    auto-MediaInfo, stats, and the final 'Done!' message. Used by every
+    download engine (direct HTTP, yt-dlp) so /usetting behaves identically
+    no matter where the file came from."""
+    # ---- Apply /usetting naming (name-swap + prefix/suffix) ----
+    settings = await settings_db.get_settings(job.user_id)
+    filename = apply_naming(filename, settings)
+    job.current_name = filename
+
+    # ---- Correct a disguised extension (e.g. a real video served as a
+    # misleading ".zip" to dodge filters) so it uploads as native media
+    # and its audio/subtitle languages can be read for the caption. ----
+    if not metadata_mod.is_media_file(filename):
+        corrected_ext = await metadata_mod.detect_real_container(dest_path)
+        if corrected_ext:
+            filename = os.path.splitext(filename)[0] + corrected_ext
+
+    # ---- Optional custom metadata embed (Global/Video/Audio/Subtitle
+    # templates from /usetting -> Metadata, audio/video files only, via
+    # ffmpeg) ----
+    has_metadata = any(
+        settings.get(k) for k in ("metadata_title", "metadata_global", "metadata_video", "metadata_audio", "metadata_subtitle")
+    )
+    if has_metadata and metadata_mod.is_media_file(filename):
+        job.phase = "splitting"  # reuse an existing, harmless status label
+        await _safe_edit(status_msg, "🏷 Embedding metadata...")
+        dest_path, meta_debug = await metadata_mod.embed_custom_metadata(dest_path, filename, settings)
+        if meta_debug and meta_debug.startswith("FAILED"):
+            await client.send_message(status_msg.chat.id, f"⚠️ Metadata: ```\n{meta_debug}\n```")
+
+    final_size = os.path.getsize(dest_path)
+    await _safe_edit(status_msg, f"✅ Downloaded {human_size(final_size)}. Preparing upload...")
+
+    max_bytes = config.MAX_FILE_SIZE_MB * 1024 * 1024
+    effective_split_mb = settings.get("split_size_mb") or config.SPLIT_SIZE_MB
+    split_bytes = effective_split_mb * 1024 * 1024
+
+    # ---- Optional -e: extract a real zip archive before uploading ----
+    base_files: List[Tuple[str, str]] = [(dest_path, filename)]
+    if extract_zip:
+        try:
+            extracted = await _extract_zip_if_any(status_msg, dest_path, settings)
+        except (zipfile.BadZipFile, OSError) as exc:
+            cleanup_paths([dest_path])
+            await _safe_edit(status_msg, f"⚠️ Could not extract zip: {exc}")
+            return
+        if extracted is not None:
+            cleanup_paths([dest_path])  # don't also upload the original zip
+            if not extracted:
+                await _safe_edit(status_msg, "⚠️ Zip archive was empty.")
+                return
+            base_files = extracted
+        # extracted is None -> -e was given but this wasn't really a zip;
+        # fall through and upload the downloaded file as-is.
+
+    paths_to_upload: List[str] = []
+    part_names: List[str] = []
+
+    for file_path, name in base_files:
+        size = os.path.getsize(file_path)
+
+        if size <= max_bytes:
+            paths_to_upload.append(file_path)
+            part_names.append(name)
+            continue
+
+        if effective_split_mb <= 0:
+            cleanup_paths([p for p, _ in base_files])
+            await _safe_edit(
+                status_msg,
+                f"⚠️ {name} is {human_size(size)}, which is over the "
+                f"{config.MAX_FILE_SIZE_MB} MB limit, and splitting is disabled."
+            )
+            return
+
+        job.phase = "splitting"
+        await _safe_edit(status_msg, f"✂️ Splitting {name} ({human_size(size)})...")
+        try:
+            parts = split_file(file_path, split_bytes)
+        except OSError as exc:
+            cleanup_paths([p for p, _ in base_files])
+            await _safe_edit(status_msg, f"⚠️ Could not split {name}: {exc}")
+            return
+        cleanup_paths([file_path])  # original part no longer needed once split
+        job.part_paths.extend(parts)
+        n = split_path_parts(size, split_bytes)
+        for idx, part_path in enumerate(parts):
+            paths_to_upload.append(part_path)
+            part_names.append(f"{name}.part{idx+1:03d}of{n:03d}")
+
+    # ---- Upload ----
+    job.phase = "uploading"
+    job.upload_count = len(paths_to_upload)
+    asyncio.create_task(_run_status_loop(status_msg, job, {"uploading"}, "Telegram Upload", "#Leech", _user_mention(message)))
+
+    for i, (path, name) in enumerate(zip(paths_to_upload, part_names), start=1):
+        if job.cancelled:
+            cleanup_paths(paths_to_upload)
+            if extract_zip:
+                shutil.rmtree(dest_path + "_extracted", ignore_errors=True)
+            await _safe_edit(status_msg, "🛑 Cancelled.")
+            return
+
+        job.upload_index = i
+        job.current_name = name
+        job.downloaded = 0
+        job.total = os.path.getsize(path)
+        job.start_time = time.time()
+
+        def upload_progress(current: int, total: int) -> None:
+            job.downloaded = current
+            job.total = total
+
+        caption = await _build_media_caption(path, name, settings)
+        extras, thumb_path, generated_thumb = await _prepare_video_extras(path, name, settings)
+        try:
+            sent = await upload_file(
+                client, target_chat_id, path, name,
+                caption=caption,
+                thumb=thumb_path,
+                send_as_document=settings.get("send_as_document", False),
+                progress=upload_progress,
+                **extras,
+            )
+        except RPCError as exc:
+            cleanup_paths(paths_to_upload)
+            if extract_zip:
+                shutil.rmtree(dest_path + "_extracted", ignore_errors=True)
+            await _safe_edit(status_msg, f"⚠️ Upload failed on part {i}/{job.upload_count}: {exc}")
+            return
+        finally:
+            if generated_thumb:
+                cleanup_paths([generated_thumb])
+
+        await _copy_to_dump(client, sent, settings.get("dump_chat_id"))
+        if job.upload_count == 1:  # skip split parts -- raw byte chunks aren't valid media
+            await _auto_mediainfo(client, target_chat_id, path, name)
+
+    cleanup_paths(paths_to_upload)
+    if extract_zip:
+        shutil.rmtree(dest_path + "_extracted", ignore_errors=True)
+    job.phase = "done"
+    total_time = time.time() - download_start
+    await mongo_db.record_leech(job.user_id, _username(message), final_size)
+    pm_note = " -- sent to your PM 📩" if target_chat_id != message.chat.id else ""
+    await _safe_edit(
+        status_msg,
+        f"✅ Done! {human_size(final_size)} in {int(total_time)}s"
+        + (f" ({job.upload_count} parts)" if job.upload_count > 1 else "")
+        + pm_note
+    )
+
+
 async def run_leech_job(client: Client, message: Message, status_msg: Message, job: Job,
                          url: str, custom_filename: str, target_chat_id: int, extract_zip: bool = False) -> None:
     os.makedirs(config.DOWNLOAD_DIR, exist_ok=True)
@@ -642,6 +842,7 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
 
     # ---- Download ----
     job.phase = "downloading"
+    job.current_name = custom_filename or filename_from_response(url, None)
     job.start_time = time.time()
     download_start = job.start_time
     try:
@@ -682,149 +883,48 @@ async def run_leech_job(client: Client, message: Message, status_msg: Message, j
         return
 
     filename = custom_filename or filename_from_response(url, getattr(job, "content_disposition", None))
+    await _process_downloaded_file(client, message, status_msg, job, target_chat_id, dest_path, filename, extract_zip, download_start)
 
-    # ---- Apply /usetting naming (name-swap + prefix/suffix) ----
-    settings = await settings_db.get_settings(job.user_id)
-    filename = apply_naming(filename, settings)
 
-    # ---- Correct a disguised extension (e.g. a real video served as a
-    # misleading ".zip" to dodge filters) so it uploads as native media
-    # and its audio/subtitle languages can be read for the caption. ----
-    if not metadata_mod.is_media_file(filename):
-        corrected_ext = await metadata_mod.detect_real_container(dest_path)
-        if corrected_ext:
-            filename = os.path.splitext(filename)[0] + corrected_ext
+async def run_ytdlp_job(client: Client, message: Message, status_msg: Message, job: Job,
+                         url: str, custom_filename: str, target_chat_id: int, extract_zip: bool = False) -> None:
+    """Handles a YouTube (or any other yt-dlp-supported site) link end to
+    end: download via yt-dlp -> the exact same /usetting pipeline
+    (naming, metadata, splitting, upload, MediaInfo) as a direct link."""
+    dest_dir = config.DOWNLOAD_DIR
+    os.makedirs(dest_dir, exist_ok=True)
 
-    # ---- Optional custom metadata embed (Global/Video/Audio/Subtitle
-    # templates from /usetting -> Metadata, audio/video files only, via
-    # ffmpeg) ----
-    has_metadata = any(
-        settings.get(k) for k in ("metadata_title", "metadata_global", "metadata_video", "metadata_audio", "metadata_subtitle")
-    )
-    if has_metadata and metadata_mod.is_media_file(filename):
-        job.phase = "splitting"  # reuse an existing, harmless status label
-        await _safe_edit(status_msg, "🏷 Embedding metadata...")
-        dest_path, meta_debug = await metadata_mod.embed_custom_metadata(dest_path, filename, settings)
-        if meta_debug and meta_debug.startswith("FAILED"):
-            await client.send_message(status_msg.chat.id, f"⚠️ Metadata: ```\n{meta_debug}\n```")
+    job.phase = "downloading"
+    job.current_name = custom_filename or url
+    job.start_time = time.time()
+    download_start = job.start_time
 
-    final_size = os.path.getsize(dest_path)
-    await _safe_edit(status_msg, f"✅ Downloaded {human_size(final_size)}. Preparing upload...")
+    def on_progress(downloaded: int, total: int) -> None:
+        job.downloaded = downloaded
+        job.total = total
 
-    max_bytes = config.MAX_FILE_SIZE_MB * 1024 * 1024
-    split_bytes = config.SPLIT_SIZE_MB * 1024 * 1024
+    try:
+        asyncio.create_task(_run_status_loop(status_msg, job, {"downloading"}, "yt-dlp", "#Leech", _user_mention(message)))
+        dest_path, title = await ytdlp.download(job, url, dest_dir, on_progress)
+    except ytdlp.Cancelled:
+        await _safe_edit(status_msg, "🛑 Cancelled.")
+        return
+    except ytdlp.YtdlpError as exc:
+        await _safe_edit(status_msg, f"⚠️ yt-dlp failed: {exc}")
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.error("yt-dlp error for %s: %s", url, exc, exc_info=True)
+        await _safe_edit(status_msg, f"⚠️ yt-dlp failed: {exc}")
+        return
 
-    # ---- Optional -e: extract a real zip archive before uploading ----
-    base_files: List[Tuple[str, str]] = [(dest_path, filename)]
-    if extract_zip:
-        try:
-            extracted = await _extract_zip_if_any(status_msg, dest_path, settings)
-        except (zipfile.BadZipFile, OSError) as exc:
+    if not dest_path or not os.path.exists(dest_path) or os.path.getsize(dest_path) == 0:
+        if dest_path:
             cleanup_paths([dest_path])
-            await _safe_edit(status_msg, f"⚠️ Could not extract zip: {exc}")
-            return
-        if extracted is not None:
-            cleanup_paths([dest_path])  # don't also upload the original zip
-            if not extracted:
-                await _safe_edit(status_msg, "⚠️ Zip archive was empty.")
-                return
-            base_files = extracted
-        # extracted is None -> -e was given but this wasn't really a zip;
-        # fall through and upload the downloaded file as-is.
+        await _safe_edit(status_msg, "⚠️ Download produced an empty or missing file.")
+        return
 
-    paths_to_upload: List[str] = []
-    part_names: List[str] = []
-
-    for file_path, name in base_files:
-        size = os.path.getsize(file_path)
-
-        if size <= max_bytes:
-            paths_to_upload.append(file_path)
-            part_names.append(name)
-            continue
-
-        if config.SPLIT_SIZE_MB <= 0:
-            cleanup_paths([p for p, _ in base_files])
-            await _safe_edit(
-                status_msg,
-                f"⚠️ {name} is {human_size(size)}, which is over the "
-                f"{config.MAX_FILE_SIZE_MB} MB limit, and splitting is disabled."
-            )
-            return
-
-        job.phase = "splitting"
-        await _safe_edit(status_msg, f"✂️ Splitting {name} ({human_size(size)})...")
-        try:
-            parts = split_file(file_path, split_bytes)
-        except OSError as exc:
-            cleanup_paths([p for p, _ in base_files])
-            await _safe_edit(status_msg, f"⚠️ Could not split {name}: {exc}")
-            return
-        cleanup_paths([file_path])  # original part no longer needed once split
-        job.part_paths.extend(parts)
-        n = split_path_parts(size, split_bytes)
-        for idx, part_path in enumerate(parts):
-            paths_to_upload.append(part_path)
-            part_names.append(f"{name}.part{idx+1:03d}of{n:03d}")
-
-    # ---- Upload ----
-    job.phase = "uploading"
-    job.upload_count = len(paths_to_upload)
-    asyncio.create_task(_run_status_loop(status_msg, job, {"uploading"}, "Telegram Upload", "#Leech", _user_mention(message)))
-
-    for i, (path, name) in enumerate(zip(paths_to_upload, part_names), start=1):
-        if job.cancelled:
-            cleanup_paths(paths_to_upload)
-            if extract_zip:
-                shutil.rmtree(dest_path + "_extracted", ignore_errors=True)
-            await _safe_edit(status_msg, "🛑 Cancelled.")
-            return
-
-        job.upload_index = i
-        job.downloaded = 0
-        job.total = os.path.getsize(path)
-        job.start_time = time.time()
-
-        def upload_progress(current: int, total: int) -> None:
-            job.downloaded = current
-            job.total = total
-
-        caption = await _build_media_caption(path, name, settings)
-        extras, thumb_path, generated_thumb = await _prepare_video_extras(path, name, settings)
-        try:
-            sent = await upload_file(
-                client, target_chat_id, path, name,
-                caption=caption,
-                thumb=thumb_path,
-                send_as_document=settings.get("send_as_document", False),
-                progress=upload_progress,
-                **extras,
-            )
-        except RPCError as exc:
-            cleanup_paths(paths_to_upload)
-            if extract_zip:
-                shutil.rmtree(dest_path + "_extracted", ignore_errors=True)
-            await _safe_edit(status_msg, f"⚠️ Upload failed on part {i}/{job.upload_count}: {exc}")
-            return
-        finally:
-            if generated_thumb:
-                cleanup_paths([generated_thumb])
-
-        await _copy_to_dump(client, sent, settings.get("dump_chat_id"))
-
-    cleanup_paths(paths_to_upload)
-    if extract_zip:
-        shutil.rmtree(dest_path + "_extracted", ignore_errors=True)
-    job.phase = "done"
-    total_time = time.time() - download_start
-    await mongo_db.record_leech(job.user_id, _username(message), final_size)
-    pm_note = " -- sent to your PM 📩" if target_chat_id != message.chat.id else ""
-    await _safe_edit(
-        status_msg,
-        f"✅ Done! {human_size(final_size)} in {int(total_time)}s"
-        + (f" ({job.upload_count} parts)" if job.upload_count > 1 else "")
-        + pm_note
-    )
+    filename = custom_filename or (os.path.basename(dest_path))
+    await _process_downloaded_file(client, message, status_msg, job, target_chat_id, dest_path, filename, extract_zip, download_start)
 
 
 async def run_torrent_job(client: Client, message: Message, status_msg: Message, job: TorrentJob,
@@ -834,6 +934,7 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
     upload every file the torrent contained, splitting oversized ones
     exactly like the direct-link path does."""
     job.phase = "starting"
+    job.current_name = os.path.basename(torrent_file_path) if torrent_file_path else source
     job.start_time = time.time()
 
     try:
@@ -885,7 +986,11 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
 
     settings = await settings_db.get_settings(job.user_id)
     max_bytes = config.MAX_FILE_SIZE_MB * 1024 * 1024
-    split_bytes = config.SPLIT_SIZE_MB * 1024 * 1024
+    effective_split_mb = settings.get("split_size_mb") or config.SPLIT_SIZE_MB
+    split_bytes = effective_split_mb * 1024 * 1024
+    excluded_exts = {
+        e.strip().lower() for e in (settings.get("excluded_extensions") or "").split(",") if e.strip()
+    }
 
     # ---- Optional -e: extract any real zip archives among the torrent's
     # files before uploading (each extracted entry is then named/split
@@ -921,6 +1026,10 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
 
         name = apply_naming(os.path.basename(file_path), settings)
 
+        if os.path.splitext(name)[1].lower() in excluded_exts:
+            cleanup_paths([file_path])
+            continue
+
         # Correct a disguised extension (e.g. a real video served as a
         # misleading ".zip") so it uploads as native media and its
         # audio/subtitle languages can be read for the caption.
@@ -946,7 +1055,7 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
             upload_plan.append((file_path, name))
             continue
 
-        if config.SPLIT_SIZE_MB <= 0:
+        if effective_split_mb <= 0:
             await message.reply_text(
                 f"⚠️ Skipping *{name}*: {human_size(size)} is over the "
                 f"{config.MAX_FILE_SIZE_MB} MB limit and splitting is disabled."
@@ -981,6 +1090,7 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
             return
 
         job.upload_index = i
+        job.current_name = name
         job.downloaded = 0
         job.total = os.path.getsize(path)
         job.start_time = time.time()
@@ -1001,6 +1111,8 @@ async def run_torrent_job(client: Client, message: Message, status_msg: Message,
                 **extras,
             )
             await _copy_to_dump(client, sent, settings.get("dump_chat_id"))
+            if not re.search(r"\.part\d{3}of\d{3}$", name):  # skip split parts
+                await _auto_mediainfo(client, target_chat_id, path, name)
         except RPCError as exc:
             await _safe_edit(status_msg, f"⚠️ Upload failed on {name}: {exc}")
         finally:

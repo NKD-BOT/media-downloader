@@ -11,6 +11,11 @@ import unicodedata
 from urllib.parse import urlparse, unquote
 from typing import Optional
 
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None
+
 
 def human_size(num_bytes: float) -> str:
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -60,6 +65,33 @@ def format_progress(label: str, done: int, total: int, start_time: float) -> str
     )
 
 
+_BOT_START_TIME = time.time()
+
+
+def system_stats_lines(download_dir: str, dl_speed: float, ul_speed: float) -> list:
+    """CPU/RAM/free-disk/uptime footer block for the live status card,
+    matching the classic mirror-leech-bot "Bot Stats" format. Returns an
+    empty list if psutil isn't installed or the check fails -- never
+    blocks the card itself."""
+    if psutil is None:
+        return []
+    try:
+        cpu = psutil.cpu_percent()
+        mem = psutil.virtual_memory().percent
+        disk = psutil.disk_usage(download_dir)
+        free_pct = 100 - disk.percent
+    except Exception:  # noqa: BLE001
+        return []
+    uptime = time.time() - _BOT_START_TIME
+    return [
+        "",
+        "⌬ <b>Bot Stats</b>",
+        f"┟ <b>CPU:</b> {cpu:.1f}% | <b>F:</b> {human_size(disk.free)} [{free_pct:.1f}%]",
+        f"┠ <b>RAM:</b> {mem:.1f}% | <b>UPTIME:</b> {human_eta(uptime)}",
+        f"┖ <b>DL:</b> {human_speed(dl_speed)} | <b>UL:</b> {human_speed(ul_speed)}",
+    ]
+
+
 def format_status_block(
     label: str,
     done: int,
@@ -71,11 +103,15 @@ def format_status_block(
     user_id: int,
     seeders: Optional[int] = None,
     leechers: Optional[int] = None,
+    download_dir: str = ".",
+    filename: str = "",
+    phase: str = "",
+    stop_command: str = "",
 ) -> str:
-    """Builds the rich, card-style status block used for live /leech
-    progress messages: a circle progress bar plus percentage, processed
-    size, speed, ETA, and (for torrents) seeder/leecher counts, engine,
-    upload mode, and who started the job."""
+    """Builds the rich, tree-style status card used for live /leech
+    progress messages -- filename, progress bar, processed size, ETA,
+    speed, engine, mode, a stop link/button, and a "Bot Stats" footer
+    (CPU/RAM/free disk/uptime/current speed)."""
     elapsed = max(time.time() - start_time, 0.001)
     speed = done / elapsed
     pct = (done / total * 100) if total > 0 else 0
@@ -83,19 +119,25 @@ def format_status_block(
     bar = progress_bar(done, total)
     total_str = human_size(total) if total > 0 else "?"
 
-    lines = [
-        f"✨ {label}...",
-        bar,
-        f"📊 Process   : {pct:.2f}%",
-        f"Processed : {human_size(done)} of {total_str}",
-        f"✈️ Speed     : {human_speed(speed)}",
-        f"⏱️ Time      : {human_eta(eta)} (elapsed {human_eta(elapsed)})",
-    ]
+    lines = []
+    if filename:
+        lines.append(f"<b><i>{filename}</i></b>")
+    lines.append(f"┟ {bar} {pct:.2f}%")
+    lines.append(f"┠ <b>Processed:</b> {human_size(done)} of {total_str}")
+    lines.append(f"┠ <b>Status:</b> {label} | <b>ETA:</b> {human_eta(eta)}")
     if seeders is not None and leechers is not None:
-        lines.append(f"Seeders   : {seeders} | Leechers : {leechers}")
-    lines.append(f"🚗 Engine    : {engine}")
-    lines.append(f"🤖 Mode      : {mode}")
-    lines.append(f"😊 User/ID   : {user_mention} | {user_id}")
+        lines.append(f"┠ <b>Seeders:</b> {seeders} | <b>Leechers:</b> {leechers}")
+    lines.append(f"┠ <b>Speed:</b> {human_speed(speed)} | <b>Elapsed:</b> {human_eta(elapsed)}")
+    lines.append(f"┠ <b>Engine:</b> {engine}")
+    lines.append(f"┠ <b>Mode:</b> {mode}")
+    lines.append(f"┠ <b>User/ID:</b> {user_mention} | {user_id}")
+    if stop_command:
+        lines.append(f"┖ <b>Stop:</b> {stop_command}")
+
+    dl_speed = speed if phase == "downloading" else 0.0
+    ul_speed = speed if phase == "uploading" else 0.0
+    lines.extend(system_stats_lines(download_dir, dl_speed, ul_speed))
+
     return "\n".join(lines)
 
 

@@ -100,6 +100,7 @@ class Job:
     # Telegram buttons stay tappable forever, but they only carry the
     # user_id unless we also check this.
     token: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    current_name: str = ""  # display filename shown on the live status card
 
 
 async def download_file(job: Job, url: str, dest_path: str, on_progress: ProgressCallback) -> None:

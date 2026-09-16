@@ -40,6 +40,8 @@ DEFAULTS: Dict[str, Any] = {
     "dump_chat_id": None,        # every leeched file is also copied here if set
     "name_swap_enabled": False,
     "name_swap_pairs": [],       # list of [find, replace] applied to filenames
+    "excluded_extensions": "",   # comma-separated, e.g. ".txt,.nfo,.jpg" -- skipped in torrent leeches
+    "split_size_mb": 0,          # 0 -> use the bot's global SPLIT_SIZE_MB; else this user's own limit
 }
 
 

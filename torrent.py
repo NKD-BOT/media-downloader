@@ -162,6 +162,7 @@ class TorrentJob:
     # Unique per-job token so an old Stop button left over from a previous,
     # already-finished job can't accidentally cancel a brand new one.
     token: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    current_name: str = ""  # display filename shown on the live status card
 
 
 async def add_torrent(job: TorrentJob, source: str, torrent_file_path: Optional[str] = None) -> None:
