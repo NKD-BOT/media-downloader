@@ -101,6 +101,7 @@ class Job:
     # user_id unless we also check this.
     token: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     current_name: str = ""  # display filename shown on the live status card
+    download_mode: str = ""  # "parallel x4" / "single" -- set by download_file(), shown on the card
 
 
 async def _probe_range_support(session: aiohttp.ClientSession, url: str) -> tuple:
@@ -246,9 +247,16 @@ async def download_file(job: Job, url: str, dest_path: str, on_progress: Progres
 
             if use_parallel:
                 job.total = total
+                job.download_mode = f"parallel x{config.PARALLEL_CONNECTIONS}"
                 await _download_parallel(session, url, dest_path, total, job, on_progress)
                 downloaded = job.downloaded
             else:
+                reason = (
+                    "server doesn't support Range" if not supports_range
+                    else "file below parallel threshold" if total < config.PARALLEL_MIN_SIZE_MB * 1024 * 1024
+                    else "parallel disabled"
+                )
+                job.download_mode = f"single -- {reason}"
                 total, content_disposition = await _download_single(session, url, dest_path, job, on_progress)
                 downloaded = job.downloaded
 

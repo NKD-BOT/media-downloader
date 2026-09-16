@@ -18,9 +18,11 @@ running is rejected with a clear message rather than silently queued.
 """
 
 import asyncio
+import json
 import os
 import re
 import shutil
+import sys
 import time
 import logging
 import zipfile
@@ -236,9 +238,17 @@ async def _run_status_loop(status_msg: Message, job: "AnyJob", phases: set, engi
             if torrent:
                 seeders = job.seeders
                 leechers = max(job.connections - job.seeders, 0)
+            # For a direct-link download, show whether parallel/segmented
+            # mode actually kicked in (and why not, if it didn't) -- lets
+            # you tell "still slow because the source throttles regardless
+            # of connections" apart from "parallel never engaged".
+            current_engine = engine
+            dl_mode = getattr(job, "download_mode", "")
+            if dl_mode and job.phase == "downloading":
+                current_engine = f"{engine} [{dl_mode}]"
             text = format_status_block(
                 _status_label(job), job.downloaded, job.total, job.start_time,
-                engine=engine, mode=mode, user_mention=user_mention, user_id=job.user_id,
+                engine=current_engine, mode=mode, user_mention=user_mention, user_id=job.user_id,
                 seeders=seeders, leechers=leechers,
                 download_dir=config.DOWNLOAD_DIR, filename=job.current_name, phase=job.phase,
             )
@@ -429,7 +439,10 @@ def register_handlers(app: Client) -> None:
             if torrent_support_enabled()
             else f"Torrent/magnet support: disabled ⚠️ ({torrent_disabled_reason()})"
         )
-        owner_line = "\n`/a` — authorize/de-authorize *this* group for /leech (owner-only)\n" if _is_owner(message.from_user.id if message.from_user else 0) else ""
+        owner_line = (
+            "\n`/a` — authorize/de-authorize *this* group for /leech (owner-only)\n"
+            "`/restart` — restart the bot process (owner-only)\n"
+        ) if _is_owner(message.from_user.id if message.from_user else 0) else ""
         await message.reply_text(
             "`/leech <url> [filename]` — download a direct link and upload it here (`/l` shortcut also works)\n"
             "`/leech <url> -e` — download a .zip and upload its extracted contents instead of the zip\n"
@@ -463,6 +476,9 @@ def register_handlers(app: Client) -> None:
             engine = "aria2c (BitTorrent)"
         else:
             engine = "Direct HTTP"
+            dl_mode = getattr(job, "download_mode", "")
+            if dl_mode and job.phase == "downloading":
+                engine = f"{engine} [{dl_mode}]"
 
         seeders = leechers = None
         if isinstance(job, TorrentJob):
@@ -526,6 +542,23 @@ def register_handlers(app: Client) -> None:
             await message.reply_text("✅ This group is now authorized -- /leech works here.")
         else:
             await message.reply_text("🚫 This group is no longer authorized -- /leech is disabled here.")
+
+    @app.on_message(filters.command("restart"))
+    async def restart_cmd(client: Client, message: Message):
+        if not _is_owner(message.from_user.id if message.from_user else 0):
+            return  # silent -- don't reveal this command exists to non-owners
+
+        status = await message.reply_text("🔄 Restarting...")
+        try:
+            with open(config.RESTART_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"chat_id": status.chat.id, "message_id": status.id}, f)
+        except OSError as exc:
+            logger.warning("Could not save restart state: %s", exc)
+
+        # Replaces this process in place with a fresh one running the same
+        # script -- main.py's startup then finds the note above and edits
+        # this same message into a confirmation once it's back online.
+        os.execl(sys.executable, sys.executable, *sys.argv)
 
     @app.on_message(filters.command(["leech", "l"]))
     async def leech_cmd(client: Client, message: Message):

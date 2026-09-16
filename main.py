@@ -4,10 +4,13 @@ Entry point for the direct-link leech bot. Validates config and runs
 the Pyrofork client.
 """
 
+import asyncio
+import json
 import logging
+import os
 import sys
 
-from pyrogram import Client
+from pyrogram import Client, idle
 
 import config
 from handlers import register_handlers
@@ -36,6 +39,34 @@ def build_client() -> Client:
     )
 
 
+async def _confirm_restart(app: Client) -> None:
+    """If /restart left a note behind (see handlers.restart_cmd), this is
+    the first thing the new process does once it's back online: edit that
+    "🔄 Restarting..." message into a confirmation, then clean up the note
+    so a normal crash-restart doesn't also try to edit a stale message."""
+    if not os.path.exists(config.RESTART_STATE_PATH):
+        return
+    try:
+        with open(config.RESTART_STATE_PATH, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        await app.edit_message_text(state["chat_id"], state["message_id"], "✅ Restarted successfully!")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not confirm restart: %s", exc)
+    finally:
+        try:
+            os.remove(config.RESTART_STATE_PATH)
+        except OSError:
+            pass
+
+
+async def _run(app: Client) -> None:
+    await app.start()
+    await _confirm_restart(app)
+    logger.info("Bot started")
+    await idle()
+    await app.stop()
+
+
 def main() -> None:
     try:
         config.validate_required_for_runtime()
@@ -56,7 +87,7 @@ def main() -> None:
 
     logger.info("Starting leech bot")
     try:
-        app.run()
+        asyncio.run(_run(app))
     finally:
         stop_aria2_daemon()
 

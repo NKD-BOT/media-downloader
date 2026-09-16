@@ -66,6 +66,10 @@ PARALLEL_MIN_SIZE_MB: int = _get_int("PARALLEL_MIN_SIZE_MB", 20)
 # (uploads AND downloads-to-the-bot). Separate from PARALLEL_CONNECTIONS
 # above, which is this bot's own direct-link downloader.
 MAX_CONCURRENT_TRANSMISSIONS: int = _get_int("MAX_CONCURRENT_TRANSMISSIONS", 4)
+
+# Where /restart leaves a note (chat_id + message_id) for the *next* run
+# of the process to edit into "Restarted!" once it's back up.
+RESTART_STATE_PATH: str = os.getenv("RESTART_STATE_PATH", "restart_state.json")
 REQUEST_TIMEOUT_SECONDS: int = _get_int("REQUEST_TIMEOUT_SECONDS", 3600)
 # Separate, much shorter timeouts for establishing the connection and for
 # any single stalled read -- without these, a server that silently hangs
