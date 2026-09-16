@@ -62,6 +62,10 @@ DOWNLOAD_CHUNK_SIZE: int = 1024 * 1024  # 1 MiB streaming chunks
 # requests (auto-detected) and the file is at least PARALLEL_MIN_SIZE_MB.
 PARALLEL_CONNECTIONS: int = _get_int("PARALLEL_CONNECTIONS", 4)
 PARALLEL_MIN_SIZE_MB: int = _get_int("PARALLEL_MIN_SIZE_MB", 20)
+# Pyrofork's own connection parallelism for talking to Telegram itself
+# (uploads AND downloads-to-the-bot). Separate from PARALLEL_CONNECTIONS
+# above, which is this bot's own direct-link downloader.
+MAX_CONCURRENT_TRANSMISSIONS: int = _get_int("MAX_CONCURRENT_TRANSMISSIONS", 4)
 REQUEST_TIMEOUT_SECONDS: int = _get_int("REQUEST_TIMEOUT_SECONDS", 3600)
 # Separate, much shorter timeouts for establishing the connection and for
 # any single stalled read -- without these, a server that silently hangs

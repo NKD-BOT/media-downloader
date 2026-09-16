@@ -27,6 +27,12 @@ def build_client() -> Client:
         api_id=config.API_ID,
         api_hash=config.API_HASH,
         bot_token=config.BOT_TOKEN,
+        # Pyrofork sends/receives a file's parts sequentially over ONE
+        # connection by default (max 1). Raising this lets it use several
+        # connections at once for both uploads and downloads-to-the-bot
+        # (e.g. reading an uploaded .torrent/thumbnail), often multiplying
+        # real-world Telegram transfer speed.
+        max_concurrent_transmissions=config.MAX_CONCURRENT_TRANSMISSIONS,
     )
 
 
