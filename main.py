@@ -62,7 +62,11 @@ async def _confirm_restart(app: Client) -> None:
 async def _run(app: Client) -> None:
     await app.start()
     await _confirm_restart(app)
-    logger.info("Bot started")
+    try:
+        me = await app.get_me()
+        logger.info("Bot started as @%s (id=%s)", me.username, me.id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Bot started, but get_me() failed: %s", exc)
     await idle()
     await app.stop()
 

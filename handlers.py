@@ -27,7 +27,7 @@ import logging
 import zipfile
 from typing import Dict, List, Optional, Tuple, Union
 
-from pyrogram import Client, filters
+from pyrogram import Client, ContinuePropagation, filters
 from pyrogram.enums import ChatType
 from pyrogram.types import (
     CallbackQuery,
@@ -299,6 +299,23 @@ async def _extract_zip_if_any(status_msg: Message, zip_path: str, settings: dict
 
 
 def register_handlers(app: Client) -> None:
+
+    @app.on_message(filters.all, group=-1)
+    async def _debug_log_every_update(client: Client, message: Message):
+        # Runs before every other handler (group=-1) and never stops
+        # propagation, so it's a pure diagnostic: if this line never shows
+        # up in the logs when you message the bot, Telegram updates aren't
+        # reaching this process at all (e.g. a duplicate/orphaned instance
+        # elsewhere is soaking them up) -- if it DOES show up but nothing
+        # else happens, the bug is in a specific handler/filter instead.
+        try:
+            chat_id = message.chat.id if message.chat else "?"
+            user_id = message.from_user.id if message.from_user else "?"
+            text_preview = (message.text or message.caption or "<non-text>")[:80]
+            logger.info("INCOMING update: chat=%s user=%s text=%r", chat_id, user_id, text_preview)
+        except Exception:  # noqa: BLE001
+            logger.exception("Debug logger itself failed")
+        raise ContinuePropagation
 
     @app.on_message(filters.command("start"))
     async def start_cmd(client: Client, message: Message):
