@@ -10,6 +10,7 @@ import logging
 import os
 import sys
 
+import aiohttp
 from pyrogram import Client, idle
 
 import config
@@ -39,6 +40,26 @@ def build_client() -> Client:
     )
 
 
+async def _clear_webhook() -> None:
+    """If a webhook was EVER set for this bot token (even by a totally
+    different project, at any point in the past), Telegram delivers every
+    update to that URL instead of to this MTProto session -- the bot
+    connects and looks perfectly healthy, but literally never receives a
+    single update. Bot-API's deleteWebhook is the only fix, and it's safe
+    to call unconditionally on every startup (a no-op if none was set)."""
+    url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/deleteWebhook"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params={"drop_pending_updates": "false"}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                data = await resp.json()
+        if data.get("ok"):
+            logger.info("deleteWebhook: ok (result=%s)", data.get("result"))
+        else:
+            logger.warning("deleteWebhook returned an error: %s", data)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Could not call deleteWebhook (continuing anyway): %s", exc)
+
+
 async def _confirm_restart(app: Client) -> None:
     """If /restart left a note behind (see handlers.restart_cmd), this is
     the first thing the new process does once it's back online: edit that
@@ -60,6 +81,7 @@ async def _confirm_restart(app: Client) -> None:
 
 
 async def _run(app: Client) -> None:
+    await _clear_webhook()
     await app.start()
     await _confirm_restart(app)
     try:
