@@ -24,6 +24,16 @@ logging.basicConfig(
 )
 logger = logging.getLogger("leech.main")
 
+if os.getenv("DEBUG_PYROGRAM", "").strip().lower() in ("1", "true", "yes", "on"):
+    # Verbose, wire-level Pyrogram logging -- shows every raw incoming
+    # Update object as it's received, before our own dispatcher/filters
+    # ever see it. Use this to tell apart "Telegram genuinely never sends
+    # us an update" from "we receive it but drop it somewhere internally".
+    # Off by default since it's extremely noisy; set DEBUG_PYROGRAM=true
+    # temporarily while diagnosing, then unset it again.
+    logging.getLogger("pyrogram").setLevel(logging.DEBUG)
+    logger.info("DEBUG_PYROGRAM is on -- verbose Pyrogram wire-level logging enabled.")
+
 
 def build_client() -> Client:
     return Client(
@@ -31,13 +41,6 @@ def build_client() -> Client:
         api_id=config.API_ID,
         api_hash=config.API_HASH,
         bot_token=config.BOT_TOKEN,
-        # Keeps the MTProto session in memory instead of writing a
-        # .session file to disk. Rules out disk-permission/corrupted-
-        # session issues on hosts with a restrictive filesystem (e.g. a
-        # container that resets on every deploy) -- there's nothing to
-        # persist here anyway since this process is stateless between
-        # restarts.
-        in_memory=True,
         # Pyrofork sends/receives a file's parts sequentially over ONE
         # connection by default (max 1). Raising this lets it use several
         # connections at once for both uploads and downloads-to-the-bot
@@ -53,24 +56,14 @@ async def _clear_webhook() -> None:
     update to that URL instead of to this MTProto session -- the bot
     connects and looks perfectly healthy, but literally never receives a
     single update. Bot-API's deleteWebhook is the only fix, and it's safe
-    to call unconditionally on every startup (a no-op if none was set).
-
-    drop_pending_updates=true is essential here, not optional: if this
-    bot token was EVER polled via plain Bot-API getUpdates (by this bot,
-    an earlier version of it, or any other project sharing the token),
-    Telegram queues updates server-side until they're acknowledged with
-    an offset. That queue blocks MTProto (Pyrogram) from receiving NEW
-    updates too -- the bot looks fully connected in the logs, but every
-    message just piles up server-side instead of arriving. Dropping the
-    backlog on every boot keeps that queue from ever getting stuck again.
-    """
+    to call unconditionally on every startup (a no-op if none was set)."""
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/deleteWebhook"
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, params={"drop_pending_updates": "true"}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            async with session.post(url, params={"drop_pending_updates": "false"}, timeout=aiohttp.ClientTimeout(total=15)) as resp:
                 data = await resp.json()
         if data.get("ok"):
-            logger.info("deleteWebhook (dropped pending updates): ok (result=%s)", data.get("result"))
+            logger.info("deleteWebhook: ok (result=%s)", data.get("result"))
         else:
             logger.warning("deleteWebhook returned an error: %s", data)
     except Exception as exc:  # noqa: BLE001
